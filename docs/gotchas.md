@@ -124,10 +124,13 @@ this repo has started a docker daemon. `nixdocker.daemon.firewallBackend` is the
 with a `null` default (say nothing, leave docker's own default, which is `iptables`) and an
 option description that says exactly this much and no more.
 
-For the host this repo is scoped to, the live starting point is: `iptables` is v1.8.13 with the
-**nf_tables** backend -- the compatibility shim, not legacy -- and the existing nft tables are
-`inet corbet_fw` plus libvirt's own `ip/ip6 libvirt_network`, alongside the `ip filter/mangle/nat`
-and `ip6 filter/mangle` tables the shim presents. Docker left at the default would add its own
+The starting point this matters for is the common one on a current Arch-family host: `iptables` is
+1.8.x with the **nf_tables** backend -- the compatibility shim, not legacy -- so a host may already
+carry a native firewall table of its own, plus libvirt's `ip/ip6 libvirt_network` if libvirt is
+installed, alongside the `ip filter/mangle/nat` and `ip6 filter/mangle` tables the shim itself
+presents. Note that the shim synthesizes those builtin chains even when no rule exists, which is
+why "does an iptables chain exist" is not a reliable test for whether a host is legacy-backed.
+Docker left at the default would add its own
 chains through that shim; `firewallBackend = "nftables"` is the option that would instead put them
 in a native table. Which of the two a host wants is a decision about that host, not a default this
 repo may pick.
