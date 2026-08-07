@@ -1,237 +1,214 @@
 # docs/gotchas.md
 
-Mechanism-level findings, verified empirically against a real podman/systemd install before this
-repo's first commit -- recorded so none of them get rediscovered the hard way. See the main
-[README](../README.md) for the design these findings justify.
+Mechanism-level findings this repo's design is built on -- transcripts, not assertions. Every one
+was checked directly on a real host (Arch, systemd 261, docker 29.7.1, `iptables` v1.8.13
+(nf_tables)) or read directly out of the shipped binaries. See the main [README](../README.md) for
+the design these findings justify.
 
-## The generator really is just an offline INI-to-unit translator
+Where a finding could only be established by reading a binary's string table rather than by running
+it, this file says so. That distinction is load-bearing: it is the difference between "the daemon
+accepts this key" and "this key does what the docs say", and only the first is claimed.
 
-```
-$ find $(nix build --print-out-paths nixpkgs#podman)/lib/systemd -iname '*generator*'
-.../lib/systemd/system-generators/podman-system-generator
-.../lib/systemd/user-generators/podman-user-generator
-```
+## Docker ships no systemd generator, and that is the whole reason this repo is shaped differently from `nixpods`
 
-Both are plain symlinks to the same `quadlet` binary. Feeding it a `.container` file with a
-digest-pinned `Image=` through `QUADLET_UNIT_DIRS`, with no root, no running podman daemon, and no
-network reachable, produced a real unit:
+The podman package contains `lib/systemd/system-generators/podman-system-generator` and
+`lib/systemd/user-generators/podman-user-generator`, both symlinks to its `quadlet` binary -- a
+pure, offline INI-to-unit translator. `nixpods` exists because that binary can be run inside the
+Nix build sandbox, at build time, so a malformed input fails the build rather than silently
+producing no unit at boot.
 
-```
-[Unit]
-Wants=network-online.target
-After=network-online.target
-Description=demo container
-SourcePath=/tmp/.../demo.container
-RequiresMountsFor=%t/containers
+The docker package contains nothing equivalent: no generator directory, no quadlet, no offline
+translator of any kind. A docker container under systemd is a unit whose `ExecStart=` is a
+foreground `docker run` **client**; the container itself is a child of `dockerd`/`containerd`.
 
-[Service]
-Restart=on-failure
-Type=notify
-NotifyAccess=all
-ExecStart=/nix/store/.../bin/podman run --name systemd-demo --replace --rm --cgroups=split \
-  --sdnotify=conmon -d docker.io/library/nginx@sha256:0000...
+So nixdocker writes the unit itself, and its build-time guarantee is correspondingly smaller: the
+argv is checked for *shape* by the Nix type system and by this repo's own assertions, and nothing
+anywhere checks that the docker CLI would accept it, because answering that needs a running daemon.
+The README's "What this repo cannot promise" says the same thing in the place a reader meets first.
 
-[Install]
-WantedBy=multi-user.target
-```
+## `ExecStart=` is not a shell, and a quoted absolute path -- even behind a `-` prefix -- is fine
 
-`systemd-analyze verify` on that unit exited `0` with no output -- clean, on the first try, no
-extra flags.
-
-## `Pod=` resolves to a literal `BindsTo=`/`After=` pair at generation time, not a runtime lookup
-
-A container with `Pod=demopod.pod` generated:
+The single most load-bearing mechanical question in this repo: units here render
+`ExecStart="/usr/bin/docker" "run" "--name=web" ...`, with **every** argument JSON-quoted including
+the executable, and `ExecStartPre=-"/usr/bin/docker" "rm" "--force" "web"`, where a `-` prefix (ignore
+a non-zero exit) sits directly in front of a quoted path. Both were checked against real systemd
+rather than assumed:
 
 ```
-[Unit]
-...
-BindsTo=demopod-pod.service
-After=demopod-pod.service
+$ systemd-analyze verify ./nixdocker-verify.service
+$ echo $?
+0
 ```
 
-and the pod's own unit generated the reverse:
+...and the same check is not vacuous -- it really does resolve that executable:
 
 ```
-[Unit]
-...
-Wants=demo2.service
-Before=demo2.service
+$ sed 's|"/usr/bin/docker"|"/usr/bin/does-not-exist-docker"|g' nixdocker-verify.service > badpath.service
+$ systemd-analyze verify ./badpath.service
+badpath.service: Command /usr/bin/does-not-exist-docker is not executable: No such file or directory
+$ echo $?
+1
 ```
 
-Both are plain text in the generated `.service` files -- nothing about `Pod=` involves a runtime
-podman query. This is exactly what makes it safe to inspect with `grep` inside a Nix build
-sandbox, which `checks/default.nix`'s `quadlet-generates-real-units` check does for real.
+That is what makes it safe to escape the whole argv uniformly (lib/render.nix's vendored
+`escapeSystemdExecArg`, from nixpkgs' `nixos/lib/utils.nix`) instead of hand-splitting the binary
+from its arguments. It matters for real values: `--health-cmd=curl -f http://localhost/health`
+contains spaces and would otherwise become four separate arguments, and any `%` in a value would be
+read by systemd as a specifier.
 
-## The generator's own exit code is not a reliable success signal -- by design, not by bug
+## systemd's `Restart=` is not docker's, and it does not tell you when you get that wrong
 
-Systemd's generator contract (`systemd.generator(5)`) forbids a generator from ever aborting the
-boot it runs during: it may log a warning and omit exactly the one broken unit while the rest of
-the boot proceeds regardless of its own exit code. Feeding the real generator several malformed
-`.container` fixtures this session found:
-
-| Input | Generator exit | `.service` produced? |
-|---|---|---|
-| missing the one required key (`Image=`) | `1` | no |
-| an unrecognized key (`ThisKeyDoesNotExist=`) | `1` | no |
-| a line with no `=` at all | `1` | no |
-| an empty file | `1` | no |
-| a syntactically valid but semantically wrong value (`HealthRetries=notanumber`) | `0` | **yes** (podman never validates that value is numeric at generation time -- it fails later, at container start) |
-
-Every case that returned a non-zero exit ALSO produced no unit -- which a bare `pkgs.runCommand`
-invocation would already have caught via its own `set -e`, no extra assertion required. That does
-not make `lib/build.nix`'s explicit "every expected `.service` file must exist" loop redundant,
-for two reasons: first, the systemd generator contract explicitly permits a zero exit alongside a
-partially-empty result set (nixpkgs issue #498524 is exactly this shape, at boot rather than at
-build time -- a generator-injected dependency going unsatisfied, invisible until something tried
-to start), and betting nixdocker' own build-time safety net on "no counter-example found yet" would
-be betting against a documented contract rather than an untested one (see
-`experiments/README.md`'s open question 001). Second, checking file PRESENCE rather than exit code
-is what actually produces the useful diagnostic: "the file you expected is missing" names the
-thing that broke, "the generator returned 1" does not.
-
-## `systemd.packages` feeds BOTH systemd manager instances, which is the whole rootless story
-
-NixOS's `systemd.packages` option is system-level, but `nixos/lib/systemd-lib.nix`'s own
-`generateUnits` function defaults its `packages` argument to that SAME list regardless of whether
-it is scanning `lib/systemd/system/` (for the root manager, from `systemd.nix`) or
-`lib/systemd/user/` (for a `--user` manager, from `systemd/user.nix`) -- both call sites read
-`cfg.packages` where `cfg = config.systemd` (confirmed by reading both files directly, not from
-memory). This is the entire reason installing a rootless object's generated unit through
-`systemd.packages` works on NixOS at all, independent of whether that same uid's `--user` manager
-would ever have run `podman-user-generator` itself correctly.
-
-It is also why rootless still needs care nixdocker cannot supply on its own: the target uid's
-`--user` manager instance has to exist before anything can start in it, which needs
-`users.users.<name>.linger = true` -- a real NixOS option (`nixos/modules/config/users-groups.nix`),
-gated behind `users.manageLingering`. nixdocker asserts nothing here beyond a by-name warning (see
-`modules/nixos.nix`) because user/uid management is out of this repo's scope, the same boundary
-`nixvm` draws around bridges it never creates.
-
-## The rootless network-online wait is a live, open nixpkgs footgun
-
-[nixpkgs#498524](https://github.com/NixOS/nixpkgs/issues/498524): Quadlet's implicit
-`podman-user-wait-network-online.service` dependency (added so a container that needs to pull an
-image waits for the network) can time out for reasons unrelated to any specific container --
-observed adding 60+ seconds to every rootless container start. `nixdocker.containers.<name>.
-waitForNetworkOnline = false` renders `DefaultDependencies=false` in the generated unit's own
-`[Quadlet]` section (a real section, distinct from the same-named `[Unit]` key systemd itself
-defines) to opt a specific container out of this dependency entirely.
-
-
-## `systemd.packages` means the same thing on system-manager -- which is why one declaration serves both planes
-
-Read out of `numtide/system-manager`'s own `nix/modules/systemd.nix`, not assumed by analogy with
-NixOS. Its `/etc/systemd/system` builder is literally:
+`unless-stopped` is a real `docker run --restart` policy name -- the literal string is in the docker
+CLI binary -- and not a systemd one. systemd does not refuse it. It *ignores* it:
 
 ```
-for package in $packages
-do
-  for hook in $package/lib/systemd/system/*
-  do
-    ln -s $hook $out/
-  done
-done
+$ systemd-analyze verify ./unless-stopped.service
+.../unless-stopped.service:5: Failed to parse Restart=unless-stopped, ignoring: Invalid argument
+$ echo $?
+0
 ```
 
-followed by the same collision rule NixOS's `overrideStrategy = "asDropin"` produces -- if a unit
-of that name already came from a package, the Nix-side definition is installed as
-`$out/<unit>.d/overrides.conf` rather than replacing it. `systemd.tmpfiles.rules` is there too,
-with NixOS's own syntax. So a package of generated `.service` files, plus a drop-in carrying
-`wantedBy`, installs identically on both planes; nothing in nixdocker' mechanism needed a per-plane
-translation table.
+The unit loads, with `Restart=no`. A service asking to be kept alive quietly never is. This is
+strictly more dangerous on the docker side than on the podman side, because `unless-stopped` is the
+spelling a docker user already has in their fingers. `nixdocker.containers.<name>.restart.policy` is
+therefore a `lib.types.enum` of systemd's seven values, which is the only place that check can
+happen.
 
-Two things genuinely do NOT cross:
-
-- **There is no `systemd/user` tree.** That etc builder emits `systemd/system` and nothing else,
-  so a rootless object would be generated correctly and installed nowhere. `modules/system-manager.nix`
-  refuses it by name instead.
-- **`virtualisation.*` does not exist.** Podman on a foreign distro is the distro's package, which
-  is what `nixdocker.podman.path` and the pre-activation assertion around it are for.
-
-## The generated `ExecStart=` binary is redirectable with one environment variable
-
-The generator names the podman that ran it, by absolute store path. It also reads `PODMAN`:
+`Type=oneshot` narrows the same list, and here systemd refuses outright rather than ignoring:
 
 ```
-$ QUADLET_UNIT_DIRS=./in podman-system-generator ./out1
-ExecStart=/nix/store/...-podman-5.8.4/bin/podman run --name systemd-%N ...
-
-$ QUADLET_UNIT_DIRS=./in PODMAN=/usr/bin/podman podman-system-generator ./out2
-ExecStart=/usr/bin/podman run --name systemd-%N ...
+$ systemd-analyze verify ./oneshot-always.service
+oneshot-always.service: Service has Restart= set to either always or on-success, which isn't allowed for Type=oneshot services. Refusing.
+Unit oneshot-always.service has a bad unit file setting.
+$ echo $?
+1
 ```
-
-Byte-identical output apart from the three `Exec*=` lines (`ExecStart`, `ExecStop`,
-`ExecStopPost`). This is what lets a foreign-distro host generate its units from a nix-built
-podman at build time and still run the distro's own podman at run time, instead of carrying a
-second copy of the CLI over one shared `/var/lib/containers`. The FLAGS in that ExecStart are
-still the generating podman's vocabulary, so the two want to stay on the same major version.
-
-## `Type=oneshot` is a real translation change, not a relabelling -- and `Type=` is the one `[Service]` key quadlet validates
-
-Quadlet copies unknown `[Service]` keys through verbatim (`X-RestartIfChanged=false` lands in the
-generated unit untouched), but it reads `Type=` itself:
-
-| `[Service] Type=` in the `.container` | generator | result |
-|---|---|---|
-| absent | exit `0` | `Type=notify`, `NotifyAccess=all`, ExecStart gains `--sdnotify=conmon -d` |
-| `oneshot` | exit `0` | `Type=oneshot`, no notify keys, ExecStart has **no** `-d` and no `--sdnotify` |
-| `simple` | exit `1`, no unit | `invalid service Type 'simple'` |
-
-So `oneshot` is what makes `systemctl start <name>` block until the container is done and report
-its exit status, rather than returning as soon as conmon says the container is up. For a job
-someone starts by hand -- rip this disc -- that difference is the whole interface.
-
-`Privileged=` is NOT a `[Container]` key, in either shape:
-
-```
-$ QUADLET_UNIT_DIRS=./in4 podman-system-generator ./out4
-quadlet-generator: converting "priv.container": unsupported key 'Privileged' in group 'Container'
-exit=1
-```
-
-`PodmanArgs=--privileged` is the supported route, and lands verbatim in the ExecStart.
-
-## systemd's `Restart=` is not Podman's, and it does not tell you when you get that wrong
-
-`unless-stopped` is a real Docker/Podman restart policy and not a systemd one. systemd does not
-refuse it -- it *ignores* it:
-
-```
-$ systemd-analyze verify a-unless-stopped.service
-a-unless-stopped.service:6: Failed to parse Restart=unless-stopped, ignoring: Invalid argument
-```
-
-The unit loads, with `Restart=no`. A service asking to be kept alive quietly never is. `nixdocker`'
-`restart.policy` enum therefore carries systemd's seven values and not Podman's vocabulary; since
-quadlet passes `[Service]` keys through unvalidated, the Nix type is the only place that check
-can happen at all.
-
-`Type=oneshot` narrows the same list further. All seven, against `systemd-analyze verify`
-(systemd 261):
-
-| `Restart=` with `Type=oneshot` | result |
-|---|---|
-| `no`, `on-failure`, `on-abnormal`, `on-abort`, `on-watchdog` | clean |
-| `always`, `on-success` | `Service has Restart= set to either always or on-success, which isn't allowed for Type=oneshot services. Refusing.` |
 
 "Refusing" means the unit does not load at all -- discovered on the host, at start time, with a
 build that succeeded. `modules/containers.nix` asserts against the accepted list instead.
 
-## A deploy can start an on-demand unit, unless the unit says otherwise
+## Two supervisors: `docker run --restart` and systemd `Restart=` do not coordinate
 
-system-manager's activator (`crates/system-manager-engine/src/activate/services.rs`) collects
-every unit whose store path changed and calls `ReloadOrRestartUnit` on it. It does not first ask
-whether the unit is running, and systemd's `reload-or-restart` job type STARTS an inactive unit.
-For an on-demand unit -- `wantedBy = [ ]`, started by hand when the hardware is actually there --
-that turns "I changed an unrelated option and redeployed" into "the job ran".
+`--restart` hands the container's lifecycle to the **daemon**, which will restart it on its own
+schedule. systemd owns the unit and will restart the `docker run` **client** on its own. Neither
+knows about the other; the visible symptom is a container that comes back while its unit reads
+`inactive`, or two of it.
 
-The escape is the same key on both planes, and both activators read it out of the `[Service]`
-section specifically:
+The daemon half-catches one shape of this. From the `dockerd` binary's own string table:
 
-- system-manager: `parse_systemd_bool(unit_info.as_ref(), "Service", "X-RestartIfChanged", true)`
-- NixOS's switch-to-configuration-ng: `parse_systemd_bool(new_unit_info, "Service", "X-RestartIfChanged", true)`,
-  and its `parse_unit` merges `<unit>.d/*.conf` drop-ins before looking
+```
+can't create 'AutoRemove' container with restart policy
+```
 
-nixpkgs' own `serviceToUnit` emits `X-RestartIfChanged=false` into `[Service]` when
-`restartIfChanged = false` -- so setting it on the drop-in nixdocker already installs for
-`wantedBy` covers both. `nixdocker.containers.<name>.restartIfChanged` is that option.
+...which only fires while `--rm` is also present -- true by default here
+(`nixdocker.containers.<name>.autoRemove`), but a default is not a guarantee, and that diagnostic
+arrives at container-start time on the host. `modules/containers.nix` refuses a `--restart` in
+`extraArgs` at evaluation time instead.
+
+## Docker 29 has a native nftables firewall backend -- vocabulary confirmed from the binary, behaviour not
+
+This is the finding that decides whether docker can live on a host that is removing iptables. Read
+out of the shipped `dockerd` (docker 29.7.1) string table:
+
+| String found in `dockerd` | What it establishes |
+|---|---|
+| `firewall-backend` next to `json:"firewall-backend,omitempty"` on a `FirewallBackend` field | it is a real `daemon.json` key, not a CLI-only flag |
+| `invalid firewall-backend` | the daemon validates the value and rejects an unrecognised one |
+| `firewall-backend is set to nftables: %v` | `nftables` is a recognised value |
+| `nftables: created chain`, `nftables: appended rule`, `nftables table`, `sending nft commands: ` | there is a real nftables implementation behind it, driving the `nft` tool |
+| `Failed to find nft tool` | ...which is an external binary the daemon expects to find |
+| `nftables is incompatible with swarm mode` | and a documented restriction that comes with it |
+
+What is NOT established: that either backend behaves as advertised on any specific host. Nothing in
+this repo has started a docker daemon. `nixdocker.daemon.firewallBackend` is therefore an option
+with a `null` default (say nothing, leave docker's own default, which is `iptables`) and an
+option description that says exactly this much and no more.
+
+For the host this repo is scoped to, the live starting point is: `iptables` is v1.8.13 with the
+**nf_tables** backend -- the compatibility shim, not legacy -- and the existing nft tables are
+`inet corbet_fw` plus libvirt's own `ip/ip6 libvirt_network`, alongside the `ip filter/mangle/nat`
+and `ip6 filter/mangle` tables the shim presents. Docker left at the default would add its own
+chains through that shim; `firewallBackend = "nftables"` is the option that would instead put them
+in a native table. Which of the two a host wants is a decision about that host, not a default this
+repo may pick.
+
+## Published ports bypass a host's INPUT rules, by design
+
+Docker's port publishing works by DNAT plus a FORWARD accept, not by anything in the INPUT chain --
+so a host firewall that filters INPUT does not filter a published container port. `-p 8080:80`
+listens on every interface; `-p 127.0.0.1:8080:80` does not. That is the difference between a port
+reachable from the LAN and one reachable from the host only, and it is the reason
+`nixdocker.containers.<name>.ports`' own option description says so rather than leaving it to be
+rediscovered.
+
+## Docker's healthcheck never reaches systemd
+
+`--health-cmd` and its four companions (`--health-interval`, `--health-timeout`,
+`--health-retries`, `--health-start-period` -- all five verified present in the docker 29.7.1 CLI
+binary) set the container's health status, which `docker ps` and `docker inspect` report. Nothing
+propagates that to systemd: docker has no sd_notify path at all, so a unit whose container is
+unhealthy stays `active (running)`.
+
+Podman does have one (`--sdnotify=healthy`), which is a real capability difference between the two
+engines, not a gap in this module. `nixdocker.containers.<name>.health` is therefore documented as
+an observability signal rather than as supervision.
+
+## `docker network` has no reconcile verb
+
+There is `docker network create`, which fails when the name is taken, and `docker network inspect`,
+which answers whether it is. There is nothing that takes a desired state and moves an existing
+network to it.
+
+So `nixdocker.networks.<name>` renders a create-**if-absent** oneshot, and a network that already
+exists is left exactly as it is -- changing a `subnet` in Nix does not move a live network. The
+generated unit prints that in its own output rather than exiting silently, and the created network
+carries `--label nixdocker.managed=true` so a host can at least tell which ones came from here.
+
+Compare named volumes, where the asymmetry is docker's rather than this repo's: `docker run
+--volume=somename:/data` creates `somename` on first use, while `docker run --network=somenet`
+fails with "network somenet not found". That is why there is a `nixdocker.networks` module and
+deliberately no `nixdocker.volumes` one.
+
+## system-manager rewrites `multi-user.target` when it emits a `.wants` symlink
+
+Read out of `numtide/system-manager`'s own `nix/modules/systemd.nix`:
+
+```nix
+substituteTarget = target:
+  if target == "multi-user.target" || target == "timers.target"
+  then "system-manager.target"
+  else target;
+```
+
+So `wantedBy = [ "multi-user.target" ]` -- the default for a container here -- is the correct
+spelling on both planes, and on the system-manager plane the symlink lands in
+`system-manager.target.wants/` rather than `multi-user.target.wants/`. A host looking for the
+enable symlink in the obvious place will not find it. `checks/system-manager-eval-tests.nix` asserts
+against the substituted path for exactly this reason.
+
+## system-manager cannot drop into a distro's unit, only replace it -- which is why the daemon is pulled in by a target
+
+The same etc builder decides what happens to a Nix-side `systemd.services.<name>` definition:
+
+```sh
+for i in <every enabled unit>; do
+  fn=$(basename $i/*)
+  if [ -e $out/$fn ]; then          # a systemd.packages entry already provided this file
+    mkdir -p $out/$fn.d
+    ln -s $i/$fn $out/$fn.d/overrides.conf
+  else
+    ln -fs $i/$fn $out/            # ...otherwise it is installed as the unit itself
+  fi
+done
+```
+
+The drop-in branch only fires when some package in `systemd.packages` already provided a file of
+that name. A distro's `/usr/lib/systemd/system/docker.service` is not in that tree, so defining
+`systemd.services.docker` here would take the `else` branch and land a **replacement**
+`/etc/systemd/system/docker.service`, shadowing the distro's own.
+
+nixdocker therefore never names `docker.service` as a unit it defines. `nixdocker.daemon.enable`
+installs `nixdocker-daemon.target`, a unit this config does own, carrying `Requires=docker.service`
+-- an ordinary dependency, resolved by systemd through its normal unit search path, where the
+distro's file already is. `checks/system-manager-eval-tests.nix` asserts both halves: the target
+exists and requires it, and no `docker.service` appears in the tree this config installs.

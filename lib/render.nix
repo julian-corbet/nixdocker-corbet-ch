@@ -1,70 +1,64 @@
 # lib/render.nix
 #
-# Pure rendering: a resolved container/pod/network/volume option value (every option already at
-# its final value -- this file never sees an unset option, exactly like nixvm's
-# lib/domain-xml.nix) -> a Quadlet `.container`/`.pod`/`.network`/`.volume` INI document, as a
-# plain string. No `config`, no NixOS module system, no derivations -- which is what lets
-# checks/default.nix hit these functions directly with hand-built fixtures, no `nixosSystem` eval
-# required, and lets modules/*.nix stay thin (call a renderer, hand its output to
-# lib/build.nix's mkQuadletUnitPackage).
+# Pure rendering: a resolved container/network option value (every option already at its final
+# value -- this file never sees an unset option) -> the `docker` argv that runs it, and the shell
+# text a network's own unit executes. No `config`, no module system, no derivations -- which is
+# what lets checks/default.nix hit these functions directly with hand-built fixtures, and lets
+# modules/*.nix stay thin.
 #
-# THE TRANSLATION TABLE lives here, not in modules/*.nix, for the same reason nixfs keeps its
-# filesystem/tool catalogue in `lib/`: which typed Nix option maps to which literal Quadlet `Key=`
-# is DATA, and belongs next to the other pure data (lib/options.nix), not scattered across four
-# option-declaring files.
+# WHAT THIS FILE IS NOT, AND WHY THAT IS THE WHOLE DIFFERENCE FROM ITS PODMAN SIBLING. nixpods'
+# lib/render.nix renders Quadlet INI text, which podman's own `quadlet` binary -- a real systemd
+# generator, shipped in the podman package -- then translates into a `.service` file. nixpods runs
+# that generator inside the Nix build sandbox, which is that repo's entire thesis: a malformed
+# input fails the BUILD, because a real translator looked at it.
+#
+# DOCKER SHIPS NO SUCH BINARY. There is no docker quadlet, no `docker-system-generator`, nothing
+# in the docker package under `lib/systemd/system-generators/`. A docker container under systemd
+# is a unit whose `ExecStart=` is a foreground `docker run` client; the container itself is a
+# child of `dockerd`, not of systemd. So there is no generator to run early, and this file writes
+# the unit's command line itself.
+#
+# That is a genuinely weaker guarantee than nixpods', and this repo says so out loud rather than
+# implying otherwise (see the README's "What this repo cannot promise"). What it does buy: the
+# argv is an ordinary Nix value, visible at eval time, so checks/ can assert against the exact
+# flags without building anything -- which nixpods cannot do, because its flags only exist once
+# the generator has run.
 { lib }:
 
 let
-  # ── The generic INI renderer every unit kind below is built from ──────────────────────────
+  # VENDORED, NOT DEPENDED ON: nixpkgs' own `escapeSystemdExecArg` from `nixos/lib/utils.nix`.
   #
-  # A "section" is `{ name = "Container"; entries = [ { key = "Image"; value = ...; } ... ]; }`
-  # -- entries as an ORDERED LIST, not an attrset, because several real Quadlet keys are
-  # legitimately repeatable (`Environment=`, `Volume=`, `PublishPort=`, `AddCapability=`, ...) and
-  # the systemd/Quadlet convention for a repeated key is literally repeating the `Key=Value`
-  # line, which one attrset binding per key cannot express. `value = null` means "not set for
-  # this object", so every renderer below can list its FULL key set unconditionally and let
-  # "left at its default" mean "line omitted" -- no per-key `lib.optional` scattered through the
-  # renderers themselves.
-  # Nix's own `toString` renders `true`/`false` as "1"/"" (documented Nix coercion behavior),
-  # which is not what an INI reader expects for a key documented as taking literal `true`/
-  # `false` (Quadlet's `Internal=`, `NetworkDeleteOnStop=`, `DefaultDependencies=`, ...) --
-  # booleans need their own branch; everything else (strings, ints) coerces the way you'd expect.
-  mkValueString = value:
-    if builtins.isBool value then (if value then "true" else "false")
-    else toString value;
-
-  mkLine = key: value: "${key}=${mkValueString value}";
-
-  sectionLines = entries:
-    lib.concatMap
-      (e:
-        if e.value == null then [ ]
-        else if lib.isList e.value then map (mkLine e.key) e.value
-        else [ (mkLine e.key e.value) ])
-      entries;
-
-  # Escape-hatch sections (lib/options.nix's `extraSectionOption`) are already plain
-  # `attrsOf (either str (listOf str))` rather than ordered lists -- turn them into the same
-  # entry shape so they can be appended to a typed section's own entries.
-  extraEntries = attrs: lib.mapAttrsToList (key: value: { inherit key value; }) attrs;
-
-  mkSection = name: entries:
-    let lines = sectionLines entries;
-    in lib.optionalString (lines != [ ]) (
-      "[${name}]\n" + lib.concatStringsSep "\n" lines + "\n"
-    );
-
-  mkUnitText = sections:
-    lib.concatStringsSep "\n" (lib.filter (s: s != "") (map ({ name, entries }: mkSection name entries) sections));
+  # Copied rather than taken from the `utils` module argument for one concrete reason: everything
+  # else in this file is a pure function of `lib` alone, callable straight from checks/ with plain
+  # fixtures and no module-system evaluation, and reaching for `utils` would make the whole render
+  # layer require one. It is eight lines and it has not changed shape in years.
+  #
+  # WHY IT IS NEEDED AT ALL: `ExecStart=` is NOT parsed by a shell. systemd does its own C-style
+  # unquoting, and it expands `%`-specifiers (`%n`, `%t`, ...) and `$`-variables before exec. A
+  # health command like `curl -f http://localhost/health` contains spaces and would otherwise
+  # split into four argv entries; a `%` inside any value would be read as a specifier. `toJSON`
+  # gives the double-quoted, backslash-escaped form systemd's parser accepts, and the two
+  # replacements neutralise the specifier and variable syntax.
+  escapeSystemdExecArg = arg:
+    let
+      s =
+        if builtins.isPath arg then "${arg}"
+        else if builtins.isString arg then arg
+        else if builtins.isInt arg || builtins.isFloat arg then builtins.toString arg
+        else throw "nixdocker: escapeSystemdExecArg only allows strings, paths and numbers, got ${builtins.typeOf arg}";
+    in
+    builtins.replaceStrings [ "%" "$" ] [ "%%" "$$" ] (builtins.toJSON s);
 in
 rec {
-  inherit mkSection mkUnitText extraEntries;
+  inherit escapeSystemdExecArg;
 
-  # ── Image pinning: the one translation table this repo is actually built around ───────────
-  # THE QUESTION: given a repository, an optional human-readable tag, and an optional digest,
-  # what literal string does Quadlet's `Image=` get? The tag is NEVER by itself sufficient to
-  # resolve the image here -- see modules/containers.nix's assertion, which is what actually
-  # enforces that a digest must be present unless a host explicitly opts out.
+  escapeSystemdExecArgs = lib.concatMapStringsSep " " escapeSystemdExecArg;
+
+  # ── Image pinning: the one translation this repo shares with its podman sibling ───────────
+  # THE QUESTION: given a repository, an optional human-readable tag, and an optional digest, what
+  # literal string does `docker run` get? The tag is NEVER by itself sufficient to resolve the
+  # image here -- see modules/containers.nix's assertion, which is what actually enforces that a
+  # digest must be present unless a host explicitly opts out.
   mkImageRef = { repository, tag, digest, ... }:
     let
       tagPart = lib.optionalString (tag != null) ":${tag}";
@@ -72,124 +66,82 @@ rec {
     in
     "${repository}${tagPart}${digestPart}";
 
-  # ── [Container] ─────────────────────────────────────────────────────────────────────────
-  renderContainer = name: cfg:
+  # ── `docker run` argv for one container ──────────────────────────────────────────────────
+  #
+  # ORDER MATTERS IN EXACTLY ONE PLACE: every flag comes before the image reference, and the
+  # container's own command comes after it. Everything docker reads after the image name belongs
+  # to the container's process, not to docker -- so `extraArgs` is appended to the FLAGS, ahead of
+  # the image, and `command` is the only thing that lands behind it.
+  #
+  # Returned as a LIST, not a string, so callers (and checks/) can assert on individual arguments
+  # rather than grepping a rendered line; `escapeSystemdExecArgs` above is what turns it into the
+  # single `ExecStart=` value systemd wants.
+  mkRunArgv = { docker, name, cfg }:
     let
       image = mkImageRef cfg.image;
     in
-    mkUnitText [
-      {
-        name = "Unit";
-        entries = [
-          { key = "Description"; value = "nixdocker container ${name}"; }
-          { key = "StartLimitBurst"; value = cfg.restart.startLimitBurst; }
-          { key = "StartLimitIntervalSec"; value = cfg.restart.startLimitIntervalSec; }
-        ] ++ extraEntries cfg.extraUnitConfig;
-      }
-      {
-        name = "Quadlet";
-        entries = [
-          { key = "DefaultDependencies"; value = if cfg.waitForNetworkOnline then null else false; }
-        ];
-      }
-      {
-        name = "Container";
-        entries = [
-          { key = "Image"; value = image; }
-          { key = "Exec"; value = cfg.command; }
-          { key = "Entrypoint"; value = cfg.entrypoint; }
-          { key = "User"; value = cfg.user; }
-          { key = "Pod"; value = if cfg.pod != null then "${cfg.pod}.pod" else null; }
-          { key = "Network"; value = cfg.network; }
-          { key = "Environment"; value = lib.mapAttrsToList (k: v: "${k}=${v}") cfg.environment; }
-          { key = "Volume"; value = cfg.volumes; }
-          { key = "AddDevice"; value = cfg.devices; }
-          { key = "PublishPort"; value = cfg.ports; }
-          { key = "HealthCmd"; value = cfg.health.cmd; }
-          { key = "HealthInterval"; value = if cfg.health.cmd != null then cfg.health.interval else null; }
-          { key = "HealthTimeout"; value = if cfg.health.cmd != null then cfg.health.timeout else null; }
-          { key = "HealthRetries"; value = if cfg.health.cmd != null then cfg.health.retries else null; }
-          { key = "HealthStartPeriod"; value = if cfg.health.cmd != null then cfg.health.startPeriod else null; }
-        ] ++ extraEntries cfg.extraContainerConfig;
-      }
-      {
-        name = "Service";
-        entries = [
-          # `Type=` is the ONE [Service] key quadlet itself validates rather than copying
-          # through: it accepts `notify` (its own default, which it then implements with
-          # `-d --sdnotify=conmon`) and `oneshot`, and rejects anything else by name at
-          # generation time. `oneshot` is not a cosmetic relabelling -- the generator drops
-          # `-d` and `--sdnotify=conmon` from the ExecStart it writes, so the container runs
-          # in the FOREGROUND under systemd and the unit completes when the work does. That is
-          # the difference between `systemctl start` returning immediately and `systemctl
-          # start` returning the job's own exit status. Left unset (null) for a normal
-          # long-running container, so quadlet's own default stands unmentioned.
-          { key = "Type"; value = if cfg.oneshot then "oneshot" else null; }
-          { key = "Restart"; value = cfg.restart.policy; }
-          { key = "RestartSec"; value = cfg.restart.restartSec; }
-        ] ++ extraEntries cfg.extraServiceConfig;
-      }
-    ];
+    [ docker "run" "--name=${name}" "--pull=${cfg.pull}" ]
+    ++ lib.optional cfg.autoRemove "--rm"
+    # `--log-driver` is stated rather than left implicit: the daemon-wide default is a fact about
+    # /etc/docker/daemon.json, and a container whose logs a host expects to find with `journalctl`
+    # should not depend on it.
+    ++ lib.optional (cfg.logDriver != null) "--log-driver=${cfg.logDriver}"
+    ++ lib.optional (cfg.entrypoint != null) "--entrypoint=${cfg.entrypoint}"
+    ++ lib.optional (cfg.user != null) "--user=${cfg.user}"
+    ++ lib.optional (cfg.workdir != null) "--workdir=${cfg.workdir}"
+    ++ lib.optional (cfg.hostname != null) "--hostname=${cfg.hostname}"
+    ++ lib.optional cfg.privileged "--privileged"
+    ++ map (n: "--network=${n}") cfg.networks
+    ++ lib.mapAttrsToList (k: v: "--env=${k}=${v}") cfg.environment
+    ++ map (f: "--env-file=${f}") cfg.environmentFiles
+    ++ map (v: "--volume=${v}") cfg.volumes
+    ++ map (d: "--device=${d}") cfg.devices
+    ++ map (p: "--publish=${p}") cfg.ports
+    ++ lib.mapAttrsToList (k: v: "--label=${k}=${v}") cfg.labels
+    ++ map (c: "--cap-add=${c}") cfg.capabilities.add
+    ++ map (c: "--cap-drop=${c}") cfg.capabilities.drop
+    ++ lib.optionals (cfg.health.cmd != null) [
+      "--health-cmd=${cfg.health.cmd}"
+      "--health-interval=${cfg.health.interval}"
+      "--health-timeout=${cfg.health.timeout}"
+      "--health-retries=${toString cfg.health.retries}"
+      "--health-start-period=${cfg.health.startPeriod}"
+    ]
+    ++ cfg.extraArgs
+    ++ [ image ]
+    ++ cfg.command;
 
-  # ── [Pod] ───────────────────────────────────────────────────────────────────────────────
-  renderPod = name: cfg:
-    mkUnitText [
-      {
-        name = "Unit";
-        entries = [
-          { key = "Description"; value = "nixdocker pod ${name}"; }
-          { key = "StartLimitBurst"; value = cfg.restart.startLimitBurst; }
-          { key = "StartLimitIntervalSec"; value = cfg.restart.startLimitIntervalSec; }
-        ] ++ extraEntries cfg.extraUnitConfig;
-      }
-      {
-        name = "Pod";
-        entries = [
-          { key = "Network"; value = cfg.network; }
-          { key = "PublishPort"; value = cfg.ports; }
-        ] ++ extraEntries cfg.extraPodConfig;
-      }
-      {
-        name = "Service";
-        entries = [
-          { key = "Restart"; value = cfg.restart.policy; }
-        ] ++ extraEntries cfg.extraServiceConfig;
-      }
-    ];
+  # ── The shell a network's own unit runs ───────────────────────────────────────────────────
+  #
+  # THIS IS THE ONE IMPERATIVE CORNER OF THIS REPO, AND IT IS NOT HIDDEN. `docker network` has no
+  # apply/reconcile verb: there is `create`, which fails if the name is taken, and `inspect`, which
+  # answers whether it is. So "make sure this network exists" is a conditional create, and what it
+  # does NOT do is reconcile a network that already exists with different options -- a subnet
+  # changed in Nix does not move a live network. See the README's "What this repo cannot promise".
+  #
+  # `--label nixdocker.managed=true` is stamped on creation so a host can at least tell which
+  # networks came from here, which is the cheapest honest thing available short of reconciliation.
+  mkNetworkScript = { docker, name, cfg }:
+    let
+      createArgv = [ docker "network" "create" "--label=nixdocker.managed=true" ]
+        ++ lib.optional (cfg.driver != null) "--driver=${cfg.driver}"
+        ++ lib.optional (cfg.subnet != null) "--subnet=${cfg.subnet}"
+        ++ lib.optional (cfg.gateway != null) "--gateway=${cfg.gateway}"
+        ++ lib.optional cfg.internal "--internal"
+        ++ lib.optional cfg.ipv6 "--ipv6"
+        ++ cfg.extraArgs
+        ++ [ name ];
+    in
+    ''
+      set -euo pipefail
 
-  # ── [Network] ───────────────────────────────────────────────────────────────────────────
-  renderNetwork = name: cfg:
-    mkUnitText [
-      {
-        name = "Unit";
-        entries = [
-          { key = "Description"; value = "nixdocker network ${name}"; }
-        ] ++ extraEntries cfg.extraUnitConfig;
-      }
-      {
-        name = "Network";
-        entries = [
-          { key = "Driver"; value = cfg.driver; }
-          { key = "Internal"; value = if cfg.internal then true else null; }
-          { key = "Subnet"; value = cfg.subnet; }
-          { key = "Gateway"; value = cfg.gateway; }
-          { key = "NetworkDeleteOnStop"; value = true; }
-        ] ++ extraEntries cfg.extraNetworkConfig;
-      }
-    ];
+      if ${lib.escapeShellArgs [ docker "network" "inspect" name ]} >/dev/null 2>&1; then
+        echo "nixdocker: network ${name} already exists -- left exactly as it is."
+        echo "nixdocker: docker has no reconcile verb for networks; if its options need to change,"
+        echo "nixdocker: remove it by hand (docker network rm ${name}) and let this unit recreate it."
+        exit 0
+      fi
 
-  # ── [Volume] ────────────────────────────────────────────────────────────────────────────
-  renderVolume = name: cfg:
-    mkUnitText [
-      {
-        name = "Unit";
-        entries = [
-          { key = "Description"; value = "nixdocker volume ${name}"; }
-        ] ++ extraEntries cfg.extraUnitConfig;
-      }
-      {
-        name = "Volume";
-        entries = extraEntries cfg.extraVolumeConfig;
-      }
-    ];
+      ${lib.escapeShellArgs createArgv}
+    '';
 }

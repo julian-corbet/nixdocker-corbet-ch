@@ -1,97 +1,135 @@
 # modules/nixdocker.nix
 #
-# THE WIRING, and everything about it that is TRUE ON EVERY PLANE. Every other module in this
-# directory only declares typed options and renders INI text (lib/render.nix); this file is the
-# one place that actually:
+# THE WIRING, and everything about it that is TRUE ON EVERY PLANE. The other modules in this
+# directory only declare typed options; this file is the one place that actually turns them into
+# `systemd.services.<name>` definitions:
 #
-#   1. collects every enabled container/pod/network/volume's { ref; text; serviceName; } plus
-#      which systemd manager it belongs to (root vs the given uid's --user instance),
-#   2. hands each group to lib/build.nix's `mkQuadletUnitPackage`, which runs podman's REAL
-#      quadlet generator inside the Nix build sandbox and asserts every expected `.service` was
-#      actually produced,
-#   3. installs the ROOTFUL result via `systemd.packages`, and
-#   4. wires each unit's `wantedBy` and `restartIfChanged` as a drop-in
-#      (`overrideStrategy = "asDropin"`) onto the already-generated unit, rather than baking an
-#      `[Install]` section into the rendered text.
+#   1. renders each container's full `docker run` argv (lib/render.nix) and each network's
+#      create-if-absent script,
+#   2. writes them into ordinary systemd service definitions -- `ExecStartPre` to clear a leftover
+#      container of the same name, `ExecStart` for the foreground run, `ExecStop`/`ExecStopPost`
+#      for the stop and the sweep,
+#   3. wires each container's `Requires=`/`After=` onto the units of the networks it references,
+#      so a network exists before the container that needs it, and
+#   4. orders everything after the daemon: `Requires=docker.socket` plus `After=docker.service
+#      docker.socket`.
 #
-# WHY THIS FILE IS PLANE-NEUTRAL, AND IS NOT ITSELF THE MODULE YOU IMPORT. nixdocker runs on two
-# evaluation planes: NixOS (`nixosModules.nixdocker`) and system-manager on a foreign distro
-# (`systemManagerModules.nixdocker`). One declaration serves both, because every step above is
-# already plane-neutral -- and specifically because `systemd.packages` means the same thing in
-# both, which was read out of both implementations rather than assumed:
+# WHY `Requires=docker.socket` AND NOT `Requires=docker.service`. The socket is what makes this
+# work on a host where the daemon is not running at boot: requiring the socket starts the socket,
+# and the first connection the `docker` client makes to it is what activates the daemon. Requiring
+# the service instead would force the daemon up in the transaction even when nothing else wanted
+# it, which is the opposite of what `nixdocker.daemon.onBoot = false` is for.
 #
-#   - NixOS's `nixos/lib/systemd-lib.nix::generateUnits` scans each package's
-#     `lib/systemd/system/` and links what it finds into the unit tree;
-#   - system-manager's `nix/modules/systemd.nix` builds `/etc/systemd/system` with a literal
-#     `for package in $packages; do for hook in $package/lib/systemd/system/*; do ln -s ...`,
-#     and applies the same "if the unit already came from a package, install my definition as
-#     `<unit>.d/overrides.conf` instead" rule NixOS's `asDropin` produces.
+# WHY THERE IS NO lib/build.nix HERE, unlike in this repo's podman sibling. nixpods has one
+# because podman ships a real systemd generator (its `quadlet` binary) that nixpods runs inside
+# the Nix build sandbox: the units it installs were produced by the same translator that would
+# otherwise run at boot, and a malformed input fails the build because that translator looked at
+# it. Docker ships nothing of the kind -- no generator, no quadlet, nothing under
+# `lib/systemd/system-generators/` -- so there is no earlier translator to move; this file writes
+# the units itself, and what it can promise is correspondingly narrower. The README says so in its
+# own section rather than letting the resemblance imply otherwise.
 #
-# So the generated package installs unchanged on both, and so does the drop-in that carries
-# `wantedBy`. What does NOT survive the crossing is small and lives in the two backend modules
-# next to this one: `virtualisation.podman.*` is a NixOS-only namespace, system-manager has no
-# `systemd.user.*` tree at all (its etc builder emits `systemd/system` and nothing else -- so
-# rootless is a hard assertion there, not a silent no-op), and a foreign distro's podman is its
-# own package rather than one this config installs. Hence `nixdocker.podman.path` below.
-#
-# Nothing here ever runs podman, starts a container, or touches the network -- see the repo
-# README's "Boundaries" section for why that boundary is deliberate.
+# Nothing here ever runs docker, starts a container, or touches the network at build time.
 { lib, config, pkgs, ... }:
 
 let
   cfg = config.nixdocker;
-  build = import ../lib/build.nix { inherit lib; };
+  render = import ../lib/render.nix { inherit lib; };
 
-  # Every declared object, from all four kinds, each already carrying { ref; serviceName; text;
-  # rootless.uid; wantedBy; restartIfChanged; enable; } -- the four modules that define these
-  # submodules agree on this shape on purpose, so this file can treat "a container" and "a
-  # volume" identically from here on.
-  allObjects = lib.concatLists [
-    (lib.attrValues cfg.containers)
-    (lib.attrValues cfg.pods)
-    (lib.attrValues cfg.networks)
-    (lib.attrValues cfg.volumes)
-  ];
+  enabledContainers = lib.filter (c: c.enable) (lib.attrValues cfg.containers);
+  enabledNetworks = lib.filter (n: n.enable) (lib.attrValues cfg.networks);
 
-  enabledObjects = lib.filter (o: o.enable) allObjects;
+  anythingDeclared = enabledContainers != [ ] || enabledNetworks != [ ];
 
-  rootfulObjects = lib.filter (o: o.rootless.uid == null) enabledObjects;
-  rootlessObjects = lib.filter (o: o.rootless.uid != null) enabledObjects;
+  # docker's three built-in networks exist without a unit, so a reference to one contributes no
+  # dependency -- only a declared `nixdocker.networks.<name>` does. modules/containers.nix has
+  # already asserted that every reference is one or the other.
+  networkUnitsFor = container:
+    map (n: "${cfg.networks.${n}.serviceName}.service")
+      (lib.filter (n: cfg.networks ? ${n}) container.networks);
 
-  # Rootless objects further split BY uid: each uid gets its own `--user` manager instance, and
-  # `systemd.packages` scanning does not care which uid a `lib/systemd/user/*.service` file was
-  # meant for -- the unit lands in the ONE shared `/etc/systemd/user` tree NixOS's own
-  # `nixos/modules/system/boot/systemd/user.nix` composes for every `--user` instance alike (see
-  # lib/options.nix's rootlessOption comment). What DOES need to be per-uid is which
-  # `systemd.user.services` override each unit's `wantedBy` lands on, which is already keyed by
-  # serviceName below regardless of uid, so no further split is actually needed for THAT part --
-  # the uid only matters for the linger warning the NixOS backend raises.
-  mkUnits = type: objects: build.mkQuadletUnitPackage {
-    inherit pkgs type objects;
-    podman = cfg.podman.package;
-    podmanPath = cfg.podman.path;
-    name = "nixdocker-quadlet-${type}";
-    directoryName = "nixdocker-quadlet-units-${type}";
+  # The docker binary is named in full, by absolute path, in every Exec* line. `escapeSystemdExecArg`
+  # is applied to it as well as to the arguments -- systemd accepts a quoted executable path (this
+  # is what nixpkgs' own modules do with `utils.escapeSystemdExecArgs`, applied to a list whose
+  # head is the binary), and skipping it would leave the one string this repo does not control the
+  # shape of unescaped.
+  dockerArgs = args: render.escapeSystemdExecArgs ([ cfg.docker.path ] ++ args);
+
+  # A leading `-` tells systemd to ignore a non-zero exit. Both places it is used here are sweeps
+  # whose failure is the NORMAL case: `docker rm --force <name>` exits non-zero when there is no
+  # such container, which is exactly the state a healthy host is in before every start.
+  mkContainerService = c: lib.nameValuePair c.serviceName ({
+    description = "nixdocker container ${c.containerName}";
+
+    wantedBy = c.wantedBy;
+    inherit (c) restartIfChanged;
+
+    requires = [ "docker.socket" ] ++ networkUnitsFor c;
+    after = [ "docker.service" "docker.socket" ]
+      ++ networkUnitsFor c
+      ++ lib.optional c.waitForNetworkOnline "network-online.target";
+    wants = lib.optional c.waitForNetworkOnline "network-online.target";
+
+    unitConfig = {
+      StartLimitBurst = c.restart.startLimitBurst;
+      StartLimitIntervalSec = c.restart.startLimitIntervalSec;
+    } // c.extraUnitConfig;
+
+    serviceConfig = {
+      ExecStartPre = "-" + dockerArgs [ "rm" "--force" c.containerName ];
+      ExecStart = render.escapeSystemdExecArgs (render.mkRunArgv {
+        docker = cfg.docker.path;
+        name = c.containerName;
+        cfg = c;
+      });
+      ExecStop = "-" + dockerArgs [ "stop" "--time" (toString c.stopTimeout) c.containerName ];
+      ExecStopPost = "-" + dockerArgs [ "rm" "--force" c.containerName ];
+
+      Restart = c.restart.policy;
+      RestartSec = c.restart.restartSec;
+
+      # `TimeoutStartSec=0` (no limit) because the first start of a container whose image is not
+      # yet local includes the pull, and how long that takes is a fact about a registry and a link,
+      # not about this unit. nixpkgs' own oci-containers module reaches the same conclusion.
+      TimeoutStartSec = 0;
+
+      # Above `docker stop --time`, on purpose and by a real margin: systemd must not give up on
+      # the stop while docker is still waiting out the grace period it was told to give the
+      # container. If systemd killed the client first, the container would be left running with
+      # nothing supervising it.
+      TimeoutStopSec = c.stopTimeout + 30;
+    }
+    // lib.optionalAttrs c.oneshot { Type = "oneshot"; }
+    // c.extraServiceConfig;
+  });
+
+  mkNetworkService = n: lib.nameValuePair n.serviceName {
+    description = "nixdocker network ${n.networkName} (create if absent)";
+
+    wantedBy = n.wantedBy;
+    inherit (n) restartIfChanged;
+
+    requires = [ "docker.socket" ];
+    after = [ "docker.service" "docker.socket" ];
+
+    serviceConfig = {
+      Type = "oneshot";
+      # The containers that reference this network carry `Requires=` on it, and a Requires= on a
+      # oneshot unit that has already run is only satisfied while the unit counts as active --
+      # which for a oneshot means RemainAfterExit.
+      RemainAfterExit = true;
+      ExecStart = "${pkgs.writeShellScript "nixdocker-network-${n.networkName}" (render.mkNetworkScript {
+        docker = cfg.docker.path;
+        name = n.networkName;
+        cfg = n;
+      })}";
+    };
   };
 
-  # NOTE: `obj.serviceName` here, with NO ".service" appended -- `systemd.services.<name>` /
-  # `systemd.user.services.<name>` both already imply the suffix themselves (NixOS appends it
-  # when generating the real unit file); the on-disk file lib/build.nix looks for IS
-  # "${obj.serviceName}.service" (see its own `services = map (obj: "${obj.serviceName}.service")
-  # objects` line), but that is a filename, not this attribute name -- the two must not be
-  # confused.
-  mkOverride = obj: lib.nameValuePair obj.serviceName {
-    overrideStrategy = "asDropin";
-    inherit (obj) wantedBy restartIfChanged;
-  };
-
-  # ── cross-kind sanity: two independent checks quadlet-nix's own modules/common.nix makes,
-  # kept here because they are a property of the WHOLE collection, not of any one kind ─────────
-  duplicatePodmanNames = lib.intersectLists (lib.attrNames cfg.containers) (lib.attrNames cfg.pods);
-
+  # ── cross-kind sanity: a property of the WHOLE collection, not of any one kind ──────────────
   duplicateServiceNames =
     let
-      names = map (o: o.serviceName) enabledObjects;
+      names = map (o: o.serviceName) (enabledContainers ++ enabledNetworks);
       counts = lib.foldl' (acc: n: acc // { ${n} = (acc.${n} or 0) + 1; }) { } names;
     in
     lib.attrNames (lib.filterAttrs (_: count: count > 1) counts);
@@ -99,115 +137,75 @@ in
 {
   imports = [
     ./containers.nix
-    ./pods.nix
     ./networks.nix
-    ./volumes.nix
-    ./ripper.nix
+    ./daemon.nix
   ];
 
-  options.nixdocker.podman = {
-    # TWO DIFFERENT PODMANS, ON PURPOSE -- the one that GENERATES and the one that RUNS.
-    package = lib.mkOption {
-      type = lib.types.package;
-      default = pkgs.podman;
-      defaultText = lib.literalExpression "pkgs.podman";
-      description = ''
-        The podman package whose quadlet binary translates this config's `.container`/`.pod`/
-        `.network`/`.volume` text into real units, inside the Nix build sandbox. Always a Nix
-        package: there is no other way to run a translator at BUILD time, which is the whole
-        point of this repo.
-
-        Its version decides the flag vocabulary of the generated `ExecStart=` line, so on a host
-        where `podman.path` points at a foreign distro's own podman, keep the two on the same
-        major version.
-      '';
-    };
-
+  options.nixdocker.docker = {
     path = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      example = "/usr/bin/podman";
+      type = lib.types.str;
+      example = "/usr/bin/docker";
       description = ''
-        Absolute path to the podman binary the GENERATED units should invoke, when that is not
-        the same binary as `package`. `null` (the default, and always right on NixOS) means the
-        generated `ExecStart=` names `package`'s own store path.
+        Absolute path to the `docker` CLI every generated unit invokes.
 
-        Set this on a foreign distro managed by system-manager, where podman is the distro's own
-        package: pointing the units at a second, nix-built podman would put two copies of the CLI
-        on one host, sharing one `/var/lib/containers` and free to disagree about its on-disk
-        format. The system-manager backend defaults this to `/usr/bin/podman` for that reason.
+        ONE OPTION HERE, WHERE THE PODMAN SIBLING NEEDS TWO, and the asymmetry is the mechanism
+        difference showing through. nixpods carries both a `podman.package` (the nix package whose
+        quadlet binary translates at BUILD time) and a `podman.path` (the binary the generated unit
+        names at RUN time), and has to warn that the two want to stay on the same major version. No
+        translation happens here at all, so there is exactly one docker involved and no skew to
+        guard against.
 
-        Nothing at build time can prove a path outside the store exists -- so the system-manager
-        backend also registers a pre-activation assertion for it, which is the earliest a foreign
-        path can honestly be checked at all.
+        Each per-plane backend sets its own default: the NixOS backend points this at
+        `virtualisation.docker.package`'s own store path, the system-manager backend at
+        `/usr/bin/docker`, which is the distro's. Nothing at build time can prove a path outside
+        the store exists, so the system-manager backend also registers a pre-activation assertion
+        for it -- the earliest a foreign path can honestly be checked at all.
       '';
     };
   };
 
-  # ── computed, read-only: what the per-plane backends next to this file install ─────────────
+  # ── computed, read-only: what the per-plane backends next to this file install ──────────────
   options.nixdocker.build = {
-    systemUnits = lib.mkOption {
-      type = lib.types.nullOr lib.types.package;
-      internal = true;
-      readOnly = true;
-      description = "Generated rootful units, or null when nothing rootful is declared.";
-    };
-    userUnits = lib.mkOption {
-      type = lib.types.nullOr lib.types.package;
-      internal = true;
-      readOnly = true;
-      description = "Generated rootless units, or null when nothing rootless is declared. Installable only on a plane that has a systemd --user tree.";
-    };
-    userOverrides = lib.mkOption {
+    services = lib.mkOption {
       type = lib.types.attrsOf lib.types.raw;
       internal = true;
       readOnly = true;
-      description = "`systemd.user.services` drop-ins carrying wantedBy/restartIfChanged for the rootless units.";
+      description = "The `systemd.services` definitions this config produces, keyed by service name.";
     };
-    rootlessUids = lib.mkOption {
-      type = lib.types.attrsOf lib.types.int;
+    anythingDeclared = lib.mkOption {
+      type = lib.types.bool;
       internal = true;
       readOnly = true;
-      description = "serviceName -> uid for every rootless object, so a backend can warn (or refuse) by name without reaching into the submodules.";
+      description = "Whether any enabled container or network is declared at all -- how a backend asks whether it has work to do.";
     };
   };
 
   config = lib.mkMerge [
-    # Defined unconditionally, not under the `mkIf` below: these four are how the per-plane
-    # backends ask "is there anything to install, and what", so they have to answer honestly on
-    # a host that declared nothing. (They carry no `default` either -- nixpkgs counts an option's
-    # default as one of its definitions, and a `readOnly` option with both a default and an
-    # assignment is refused as "set multiple times".)
+    # Defined unconditionally, not under the `mkIf` below: these are how the per-plane backends ask
+    # "is there anything to install, and what", so they have to answer honestly on a host that
+    # declared nothing. (They carry no `default` either -- nixpkgs counts an option's default as one
+    # of its definitions, and a `readOnly` option with both a default and an assignment is refused
+    # as "set multiple times".)
     {
       nixdocker.build = {
-        systemUnits = if rootfulObjects == [ ] then null else mkUnits "system" rootfulObjects;
-        userUnits = if rootlessObjects == [ ] then null else mkUnits "user" rootlessObjects;
-        userOverrides = lib.listToAttrs (map mkOverride rootlessObjects);
-        rootlessUids = lib.listToAttrs (map (o: lib.nameValuePair o.serviceName o.rootless.uid) rootlessObjects);
+        services = lib.listToAttrs (map mkContainerService enabledContainers)
+          // lib.listToAttrs (map mkNetworkService enabledNetworks);
+        anythingDeclared = anythingDeclared;
       };
     }
 
-    (lib.mkIf (enabledObjects != [ ]) {
-      systemd.packages = lib.optional (rootfulObjects != [ ]) config.nixdocker.build.systemUnits;
-      systemd.services = lib.listToAttrs (map mkOverride rootfulObjects);
+    (lib.mkIf anythingDeclared {
+      systemd.services = cfg.build.services;
 
       assertions = [
-        {
-          assertion = duplicatePodmanNames == [ ];
-          message = ''
-            nixdocker: the same name (${lib.concatStringsSep ", " duplicatePodmanNames}) is used for
-            both a container and a pod. Quadlet derives each object's own Podman resource name
-            from this attribute name (systemd-<name>); a container and a pod sharing one would
-            collide in Podman's own namespace. Rename one of them.
-          '';
-        }
         {
           assertion = duplicateServiceNames == [ ];
           message = ''
             nixdocker: more than one declared object resolves to the same systemd service name
-            (${lib.concatStringsSep ", " duplicateServiceNames}). Every container/pod/network/
-            volume across nixdocker.containers, nixdocker.pods, nixdocker.networks and nixdocker.volumes
-            must produce a unique <serviceName>.service -- rename one of the colliding objects.
+            (${lib.concatStringsSep ", " duplicateServiceNames}). A network called <n> takes
+            "<n>-network", so a container literally named "<n>-network" collides with it -- every
+            declared object across nixdocker.containers and nixdocker.networks must produce a
+            unique <serviceName>.service. Rename one of the colliding objects.
           '';
         }
       ];

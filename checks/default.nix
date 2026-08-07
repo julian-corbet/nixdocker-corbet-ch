@@ -2,40 +2,33 @@
 #
 # Three kinds of check, cheapest first:
 #
-#   1. "render/*" -- pure unit tests against lib/render.nix directly. No NixOS eval, no
-#      derivation, no podman: hand-built plain-value fixtures in, an INI string out, substring
-#      assertions on the result. Same reasoning as nixvm's own "xml-render/*" group.
+#   1. "render/*" -- pure unit tests against lib/render.nix directly. No module-system eval, no
+#      derivation, no docker: hand-built plain-value fixtures in, an argv list out, assertions on
+#      the individual arguments.
 #
-#   2. Everything under `results` below -- EVAL-TIME tests through real `nixosSystem`
-#      composition (mirrors nixvm/nixboot's own checks/default.nix): does a host importing
-#      `modules/nixos.nix` evaluate at all, and -- the failing direction, proven as
-#      deliberately as the passing one -- does an unpinned image, a dangling `Pod=` reference, or
-#      a container/pod name collision each fail evaluation BY NAME rather than silently produce
-#      something half-formed.
+#   2. Everything under `results` -- EVAL-TIME tests through real `nixosSystem` composition: does a
+#      host importing `modules/nixos.nix` evaluate at all, and -- the failing direction, proven as
+#      deliberately as the passing one -- does an unpinned image, a dangling network reference, a
+#      `--restart` smuggled through `extraArgs`, a container declared while the daemon is off, or a
+#      `Type=oneshot` unit with a `Restart=` systemd would refuse to load each fail evaluation BY
+#      NAME rather than silently produce something half-formed.
 #
-#   3. `quadlet-generates-real-units` and `quadlet-honours-foreign-podman-path` -- the checks in
-#      this file that are ACTUAL BUILDS, not eval-time assertions: they run lib/build.nix's
-#      `mkQuadletUnitPackage` against well-formed rendered containers for real, then grep the
-#      generated `.service` for the exact lines that prove the mechanism (a real
-#      `ExecStart=.../podman run`, `Type=notify`, `NotifyAccess=all`, the `Pod=` reference
-#      resolved to a literal `BindsTo=`, the healthcheck flag, the pod's reverse `Wants=`; and,
-#      for the second, a redirected podman path plus the flags a `Type=oneshot` unit must have
-#      LOST). The facts they assert are properties of the generator binary, not of any Nix code
-#      here, so an eval-time check could not reach them. The first's own comment explains why it
-#      does NOT
-#      also re-run `systemd-analyze verify` (the Nix build sandbox has no writable `/run`, which
-#      that command hardcodes) -- the claim itself was checked directly, empirically, before this
-#      repo's first commit; see docs/gotchas.md for the transcript. This check IS required to
-#      build for `nix flake check` to pass -- see checks/demo-malformed-fails-build.nix (a
-#      `packages.<system>` output, not a `checks` one) for the matching NEGATIVE proof: a
-#      malformed container fed through the exact same mechanism, left buildable on purpose so it
-#      can be watched fail.
+#   3. `renders-a-real-unit-file` -- the one ACTUAL BUILD in this file. It takes the `.service`
+#      file NixOS's own systemd machinery produced from these definitions and greps it for the
+#      lines that prove the wiring survived the round trip.
+#
+# WHY THAT THIRD TIER IS THINNER THAN THE PODMAN SIBLING'S, AND HONESTLY SO. nixpods' equivalent
+# checks run podman's real quadlet generator inside the build sandbox and grep ITS output, which
+# proves a fact about the generator binary that no eval-time check could reach. There is no docker
+# generator to run, so the only thing a build can add here is that the unit text this repo composed
+# really does come out of systemd's own unit writer intact -- worth checking, and a smaller claim.
+# What CANNOT be checked anywhere in this file is whether the rendered `docker run` argv is one the
+# docker CLI accepts: that needs a daemon, which needs root and a running host, which is exactly
+# what a check may not have. See the README's "What this repo cannot promise".
 { pkgs, lib, system, nixdockerModule }:
 
 let
   render = import ../lib/render.nix { inherit lib; };
-  build = import ../lib/build.nix { inherit lib; };
-  podman = pkgs.podman;
 
   check = name: ok: detail: { inherit name ok detail; };
 
@@ -45,7 +38,7 @@ let
   bootStub = {
     fileSystems."/" = { device = "nodev"; fsType = "tmpfs"; };
     boot.loader.grub = { enable = true; devices = [ "nodev" ]; };
-    networking.hostName = "example-pods-host";
+    networking.hostName = "example-docker-host";
     system.stateVersion = "25.05";
   };
 
@@ -56,10 +49,9 @@ let
     }).config;
 
   # Forcing `system.build.toplevel.drvPath` is what actually runs `assertions` (a bare read of
-  # `.config.assertions` is a passive list nobody enforced yet); `seq` reaches the wrapping
-  # `throw` without deep-forcing or building the whole system closure, and the string context is
-  # discarded so this stays an EVAL check, never a build -- exactly mirrors nixvm/nixboot's own
-  # `buildFails` helper.
+  # `.config.assertions` is a passive list nobody enforced yet); `seq` reaches the wrapping `throw`
+  # without deep-forcing or building the whole system closure, and the string context is discarded
+  # so this stays an EVAL check, never a build.
   evalToplevel = extraConfig:
     builtins.tryEval (builtins.seq
       (builtins.unsafeDiscardStringContext (evalNixos extraConfig).system.build.toplevel.drvPath)
@@ -69,97 +61,177 @@ let
   buildFails = extraConfig: !(evalToplevel extraConfig).success;
 
   # ── Fixtures ─────────────────────────────────────────────────────────────────────
+  daemonOn = { nixdocker.daemon.enable = true; };
+
   pinnedContainer = {
-    nixdocker.containers.example = {
-      image = { repository = "docker.io/library/nginx"; tag = "1.27"; inherit digest; };
-    };
+    imports = [
+      daemonOn
+      {
+        nixdocker.containers.example = {
+          image = { repository = "docker.io/library/nginx"; tag = "1.27"; inherit digest; };
+        };
+      }
+    ];
   };
 
   unpinnedContainer = {
-    nixdocker.containers.example = {
-      image.repository = "docker.io/library/nginx";
-    };
+    imports = [
+      daemonOn
+      { nixdocker.containers.example.image.repository = "docker.io/library/nginx"; }
+    ];
   };
 
   unpinnedButAcknowledged = {
-    nixdocker.containers.example = {
-      image = { repository = "docker.io/library/nginx"; allowFloatingTag = true; };
-    };
-  };
-
-  containerWithMissingPod = {
-    nixdocker.containers.example = {
-      image = { repository = "docker.io/library/nginx"; inherit digest; };
-      pod = "does-not-exist";
-    };
-  };
-
-  containerWithRealPod = {
-    nixdocker.containers.example = {
-      image = { repository = "docker.io/library/nginx"; inherit digest; };
-      pod = "myapp";
-    };
-    nixdocker.pods.myapp = { };
-  };
-
-  duplicatePodContainerName = {
-    nixdocker.containers.web = {
-      image = { repository = "docker.io/library/nginx"; inherit digest; };
-    };
-    nixdocker.pods.web = { };
+    imports = [
+      daemonOn
+      {
+        nixdocker.containers.example.image = {
+          repository = "docker.io/library/nginx";
+          allowFloatingTag = true;
+        };
+      }
+    ];
   };
 
   badDigestFormat = {
+    imports = [
+      daemonOn
+      {
+        nixdocker.containers.example.image = {
+          repository = "docker.io/library/nginx";
+          digest = "not-a-real-digest";
+        };
+      }
+    ];
+  };
+
+  # THE ONE THAT MAKES "OFF BY DEFAULT" REAL: a container with no daemon.enable must not quietly
+  # evaluate, because its unit's Requires=docker.socket would bring the daemon up anyway.
+  containerWithoutDaemon = {
     nixdocker.containers.example.image = {
       repository = "docker.io/library/nginx";
-      digest = "not-a-real-digest";
+      inherit digest;
     };
   };
 
-  rootlessNoLinger = {
-    nixdocker.containers.example = {
-      image = { repository = "docker.io/library/nginx"; inherit digest; };
-      rootless.uid = 1000;
-    };
+  containerWithMissingNetwork = {
+    imports = [
+      daemonOn
+      {
+        nixdocker.containers.example = {
+          image = { repository = "docker.io/library/nginx"; inherit digest; };
+          networks = [ "does-not-exist" ];
+        };
+      }
+    ];
+  };
+
+  containerWithBuiltinNetwork = {
+    imports = [
+      daemonOn
+      {
+        nixdocker.containers.example = {
+          image = { repository = "docker.io/library/nginx"; inherit digest; };
+          networks = [ "host" ];
+        };
+      }
+    ];
+  };
+
+  containerWithRealNetwork = {
+    imports = [
+      daemonOn
+      {
+        nixdocker.containers.example = {
+          image = { repository = "docker.io/library/nginx"; inherit digest; };
+          networks = [ "backend" ];
+        };
+        nixdocker.networks.backend = { subnet = "172.28.0.0/16"; };
+      }
+    ];
+  };
+
+  containerWithSmuggledRestart = {
+    imports = [
+      daemonOn
+      {
+        nixdocker.containers.example = {
+          image = { repository = "docker.io/library/nginx"; inherit digest; };
+          extraArgs = [ "--restart=always" ];
+        };
+      }
+    ];
   };
 
   oneshotIllegalRestart = {
-    nixdocker.containers.example = {
-      image = { repository = "docker.io/library/nginx"; inherit digest; };
-      oneshot = true;
-      restart.policy = "always";
-    };
+    imports = [
+      daemonOn
+      {
+        nixdocker.containers.example = {
+          image = { repository = "docker.io/library/nginx"; inherit digest; };
+          oneshot = true;
+          restart.policy = "always";
+        };
+      }
+    ];
   };
 
+  # Deliberately declares the SAME image as `pinnedContainer` above, tag included: the
+  # "oneshot changes systemd's contract and not the command" check below compares the two
+  # rendered ExecStart lines directly, and any other difference between the fixtures would make
+  # that comparison prove nothing.
   oneshotLegalRestart = {
-    nixdocker.containers.example = {
-      image = { repository = "docker.io/library/nginx"; inherit digest; };
-      oneshot = true;
-      restart.policy = "no";
+    imports = [
+      daemonOn
+      {
+        nixdocker.containers.example = {
+          image = { repository = "docker.io/library/nginx"; tag = "1.27"; inherit digest; };
+          oneshot = true;
+          restart.policy = "no";
+          wantedBy = [ ];
+          restartIfChanged = false;
+        };
+      }
+    ];
+  };
+
+  daemonWithBothFirewallKeys = {
+    nixdocker.daemon = {
+      enable = true;
+      firewallBackend = "nftables";
+      settings."firewall-backend" = "iptables";
     };
   };
 
-  # ── the appliance: values only, exactly what a host is expected to have to say ──────────
-  ripperHost = {
-    nixdocker.ripper = {
+  daemonWithNftables = {
+    nixdocker.daemon = {
       enable = true;
-      outputDir = "/srv/rips";
-      image.digest = digest;
+      firewallBackend = "nftables";
+      dataRoot = "/var/lib/docker";
+      settings.log-driver = "journald";
     };
   };
 
-  ripperUnpinned = {
-    nixdocker.ripper = {
-      enable = true;
-      outputDir = "/srv/rips";
-    };
+  serviceNameCollision = {
+    imports = [
+      daemonOn
+      {
+        # The network `backend` takes the service name `backend-network`; a container literally
+        # called that collides with it.
+        nixdocker.networks.backend = { };
+        nixdocker.containers.backend-network.image = {
+          repository = "docker.io/library/nginx";
+          inherit digest;
+        };
+      }
+    ];
   };
 
   results = [
     # --- a fully-pinned container composes -------------------------------------------
     (check "pinned-container/toplevel-evaluates"
       (evalOk pinnedContainer)
-      "expected a container with repository+tag+digest set to evaluate cleanly")
+      "expected a container with repository+tag+digest set, alongside daemon.enable, to evaluate cleanly")
 
     (check "pinned-container/no-warnings"
       ((evalNixos pinnedContainer).warnings == [ ])
@@ -181,43 +253,67 @@ let
       (buildFails badDigestFormat)
       "expected digest = \"not-a-real-digest\" (fails the sha256:<64 hex> type) to fail evaluation, but it succeeded")
 
-    # --- Pod= must reference a pod this flake actually declares ----------------------
-    (check "container-pod-reference/fails-when-pod-undeclared"
-      (buildFails containerWithMissingPod)
-      "expected pod = \"does-not-exist\" with no matching nixdocker.pods entry to fail evaluation, but it succeeded")
+    # --- "off by default" is enforced, not merely documented -------------------------
+    (check "container-without-daemon/fails-evaluation"
+      (buildFails containerWithoutDaemon)
+      "expected a container declared while nixdocker.daemon.enable is false (its default) to fail evaluation -- its unit's Requires=docker.socket would bring the daemon up regardless, so the config would be saying something untrue about this host")
 
-    (check "container-pod-reference/succeeds-when-pod-declared"
-      (evalOk containerWithRealPod)
-      "expected pod = \"myapp\" alongside a declared nixdocker.pods.myapp to evaluate cleanly")
+    (check "daemon-off-by-default/nothing-declared-still-evaluates"
+      (evalOk { })
+      "expected a host that imports nixdocker and declares nothing at all to evaluate cleanly with no daemon")
 
-    (check "container-pod-reference/pod-text-contains-real-key"
-      (lib.hasInfix "Pod=myapp.pod" (evalNixos containerWithRealPod).nixdocker.containers.example.text)
-      "text: ${(evalNixos containerWithRealPod).nixdocker.containers.example.text}")
+    (check "daemon-off/installs-no-docker-on-the-nixos-plane"
+      (!(evalNixos { }).virtualisation.docker.enable)
+      "virtualisation.docker.enable with nixdocker imported and nothing declared: ${builtins.toJSON (evalNixos { }).virtualisation.docker.enable}")
 
-    # --- a container and a pod sharing one name is a real Podman-namespace collision -
-    (check "duplicate-podman-name/fails-evaluation"
-      (buildFails duplicatePodContainerName)
-      "expected nixdocker.containers.web and nixdocker.pods.web (same name) to fail evaluation, but it succeeded")
-
-    # --- rootless without a matching lingering user warns by name, does not block ----
-    (check "rootless-no-linger/still-evaluates"
-      (evalOk rootlessNoLinger)
-      "expected a rootless container with no matching users.users.*.linger to still evaluate (a warning, not a hard failure)")
-
-    (check "rootless-no-linger/warns-by-name"
-      (lib.any (m: lib.hasInfix "example" m && lib.hasInfix "linger" m) (evalNixos rootlessNoLinger).warnings)
-      "warnings: ${builtins.toJSON (evalNixos rootlessNoLinger).warnings}")
-
-    # --- generated systemd wiring: overrideStrategy + wantedBy reach the real option -
-    (check "container-service-override/asDropin-and-wantedBy"
+    (check "daemon-on/turns-the-nixos-docker-module-on"
       (
-        let svc = (evalNixos pinnedContainer).systemd.services.example;
-        in svc.overrideStrategy == "asDropin" && svc.wantedBy == [ "multi-user.target" ]
+        let c = evalNixos daemonWithNftables;
+        in c.virtualisation.docker.enable && c.virtualisation.docker.enableOnBoot
       )
-      "systemd.services.example: ${builtins.toJSON (evalNixos pinnedContainer).systemd.services.example}")
+      "virtualisation.docker: enable=${builtins.toJSON (evalNixos daemonWithNftables).virtualisation.docker.enable}, enableOnBoot=${builtins.toJSON (evalNixos daemonWithNftables).virtualisation.docker.enableOnBoot}")
 
-    # --- oneshot x restart policy: systemd refuses to LOAD the combination, so we refuse to
-    #     build it (systemd's own whitelist, verified with systemd-analyze -- docs/gotchas.md)
+    # --- the daemon.json document, typed knobs merged into the freeform one ----------
+    (check "daemon-settings/typed-knobs-reach-the-real-nixos-option"
+      (
+        let s = (evalNixos daemonWithNftables).virtualisation.docker.daemon.settings;
+        in s."firewall-backend" == "nftables" && s.data-root == "/var/lib/docker" && s.log-driver == "journald"
+      )
+      "virtualisation.docker.daemon.settings: ${builtins.toJSON (evalNixos daemonWithNftables).virtualisation.docker.daemon.settings}")
+
+    (check "daemon-settings/two-writers-for-one-key-fails-evaluation"
+      (buildFails daemonWithBothFirewallKeys)
+      "expected firewallBackend and settings.\"firewall-backend\" set together to fail evaluation, but it succeeded")
+
+    # --- network references must resolve, because docker does not auto-create them ---
+    (check "container-network-reference/fails-when-network-undeclared"
+      (buildFails containerWithMissingNetwork)
+      "expected networks = [ \"does-not-exist\" ] with no matching nixdocker.networks entry to fail evaluation, but it succeeded")
+
+    (check "container-network-reference/builtin-networks-need-no-declaration"
+      (evalOk containerWithBuiltinNetwork)
+      "expected networks = [ \"host\" ] (one of docker's built-ins) to evaluate cleanly with no nixdocker.networks entry")
+
+    (check "container-network-reference/succeeds-and-wires-a-real-dependency"
+      (
+        let svc = (evalNixos containerWithRealNetwork).systemd.services.example;
+        in lib.elem "backend-network.service" svc.requires && lib.elem "backend-network.service" svc.after
+      )
+      "systemd.services.example: requires=${builtins.toJSON (evalNixos containerWithRealNetwork).systemd.services.example.requires}, after=${builtins.toJSON (evalNixos containerWithRealNetwork).systemd.services.example.after}")
+
+    (check "network/renders-a-remain-after-exit-oneshot"
+      (
+        let svc = (evalNixos containerWithRealNetwork).systemd.services.backend-network;
+        in svc.serviceConfig.Type == "oneshot" && svc.serviceConfig.RemainAfterExit
+      )
+      "systemd.services.backend-network.serviceConfig: ${builtins.toJSON (evalNixos containerWithRealNetwork).systemd.services.backend-network.serviceConfig}")
+
+    # --- one supervisor: a --restart smuggled through extraArgs is refused -----------
+    (check "smuggled-restart-flag/fails-evaluation"
+      (buildFails containerWithSmuggledRestart)
+      "expected extraArgs = [ \"--restart=always\" ] to fail evaluation -- the daemon's own restart policy and systemd's Restart= are two supervisors for one container")
+
+    # --- oneshot x restart policy: systemd refuses to LOAD the combination -----------
     (check "oneshot-restart-always/fails-evaluation"
       (buildFails oneshotIllegalRestart)
       "expected oneshot = true with restart.policy = \"always\" (a combination systemd refuses to load) to fail evaluation, but it succeeded")
@@ -226,80 +322,98 @@ let
       (evalOk oneshotLegalRestart)
       "expected oneshot = true with restart.policy = \"no\" to evaluate cleanly")
 
-    (check "oneshot/renders-type-oneshot-into-the-quadlet-text"
-      (lib.hasInfix "Type=oneshot" (evalNixos oneshotLegalRestart).nixdocker.containers.example.text)
-      "text: ${(evalNixos oneshotLegalRestart).nixdocker.containers.example.text}")
-
-    # --- the ripper appliance renders into a container, values-only from the host's side ---
-    (check "ripper/host-declaring-values-only-evaluates"
-      (evalOk ripperHost)
-      "expected nixdocker.ripper with enable + outputDir + a pinned digest to evaluate cleanly")
-
-    (check "ripper/inherits-the-repo-digest-assertion"
-      (buildFails ripperUnpinned)
-      "expected an unpinned nixdocker.ripper image to fail evaluation through modules/containers.nix's own digest assertion -- an appliance must not be able to opt itself out of image pinning")
-
-    (check "ripper/is-an-on-demand-job-on-all-three-counts"
+    (check "oneshot/reaches-the-real-unit-as-type-oneshot"
       (
-        let c = (evalNixos ripperHost).nixdocker.containers.ripper;
-        in c.oneshot && c.wantedBy == [ ] && !c.restartIfChanged && c.restart.policy == "no"
+        let svc = (evalNixos oneshotLegalRestart).systemd.services.example;
+        in svc.serviceConfig.Type == "oneshot" && svc.wantedBy == [ ] && !svc.restartIfChanged
       )
-      "ripper container: oneshot=${builtins.toJSON (evalNixos ripperHost).nixdocker.containers.ripper.oneshot}, wantedBy=${builtins.toJSON (evalNixos ripperHost).nixdocker.containers.ripper.wantedBy}, restartIfChanged=${builtins.toJSON (evalNixos ripperHost).nixdocker.containers.ripper.restartIfChanged}")
+      "systemd.services.example: ${builtins.toJSON (evalNixos oneshotLegalRestart).systemd.services.example.serviceConfig}")
 
-    (check "ripper/renders-drive-mounts-and-image-contract"
+    # --- oneshot changes systemd's contract and NOT the command, unlike the podman side
+    (check "oneshot/leaves-the-docker-argv-byte-identical"
       (
-        let text = (evalNixos ripperHost).nixdocker.containers.ripper.text;
-        in lib.hasInfix "AddDevice=/dev/sr0:/dev/sr0" text
-          && lib.hasInfix "Volume=/srv/rips:/out" text
-          && lib.hasInfix "Volume=/var/lib/ripper:/config" text
-          && lib.hasInfix "GroupAdd=cdrom" text
-          && lib.hasInfix "PodmanArgs=--privileged" text
-          && lib.hasInfix "Image=docker.io/rix1337/docker-ripper:manual-latest@${digest}" text
+        let
+          plain = (evalNixos pinnedContainer).systemd.services.example.serviceConfig.ExecStart;
+          job = (evalNixos oneshotLegalRestart).systemd.services.example.serviceConfig.ExecStart;
+        in
+        plain == job
       )
-      "text: ${(evalNixos ripperHost).nixdocker.containers.ripper.text}")
+      "plain ExecStart: ${(evalNixos pinnedContainer).systemd.services.example.serviceConfig.ExecStart}\noneshot ExecStart: ${(evalNixos oneshotLegalRestart).systemd.services.example.serviceConfig.ExecStart}")
 
-    (check "ripper/no-timezone-set-passes-no-TZ"
-      (!(lib.hasInfix "TZ=" (evalNixos ripperHost).nixdocker.containers.ripper.text))
-      "text: ${(evalNixos ripperHost).nixdocker.containers.ripper.text}")
-
-    (check "ripper/creates-its-directories-owned-by-the-in-container-uid"
+    # --- generated systemd wiring: the daemon ordering every container gets ----------
+    (check "container-unit/is-ordered-against-the-daemon"
       (
-        let rules = (evalNixos ripperHost).systemd.tmpfiles.rules;
-        in lib.any (r: lib.hasInfix "/srv/rips" r && lib.hasInfix "1000 1000" r) rules
-          && lib.any (r: lib.hasInfix "/var/lib/ripper" r) rules
+        let svc = (evalNixos pinnedContainer).systemd.services.example;
+        in lib.elem "docker.socket" svc.requires
+          && lib.elem "docker.service" svc.after
+          && lib.elem "docker.socket" svc.after
       )
-      "tmpfiles.rules: ${builtins.toJSON (evalNixos ripperHost).systemd.tmpfiles.rules}")
+      "systemd.services.example: requires=${builtins.toJSON (evalNixos pinnedContainer).systemd.services.example.requires}, after=${builtins.toJSON (evalNixos pinnedContainer).systemd.services.example.after}")
 
-    (check "ripper/restartIfChanged-false-reaches-the-real-systemd-option"
-      (!(evalNixos ripperHost).systemd.services.ripper.restartIfChanged)
-      "systemd.services.ripper.restartIfChanged: ${builtins.toJSON (evalNixos ripperHost).systemd.services.ripper.restartIfChanged}")
+    (check "container-unit/sweeps-a-leftover-before-and-after"
+      (
+        let sc = (evalNixos pinnedContainer).systemd.services.example.serviceConfig;
+        in lib.hasPrefix "-" sc.ExecStartPre
+          && lib.hasInfix "rm" sc.ExecStartPre
+          && lib.hasPrefix "-" sc.ExecStopPost
+      )
+      "serviceConfig: ${builtins.toJSON (evalNixos pinnedContainer).systemd.services.example.serviceConfig}")
 
-    # --- on the NixOS plane the generated unit names this host's own podman ---------------
-    (check "nixos-plane/podman-path-defaults-to-null"
-      ((evalNixos pinnedContainer).nixdocker.podman.path == null)
-      "nixdocker.podman.path: ${builtins.toJSON (evalNixos pinnedContainer).nixdocker.podman.path}")
+    (check "container-unit/stop-timeout-exceeds-the-docker-stop-grace-period"
+      (
+        let sc = (evalNixos pinnedContainer).systemd.services.example.serviceConfig;
+        in sc.TimeoutStopSec > 10 && lib.hasInfix "--time" sc.ExecStop
+      )
+      "serviceConfig: TimeoutStopSec=${builtins.toJSON (evalNixos pinnedContainer).systemd.services.example.serviceConfig.TimeoutStopSec}, ExecStop=${(evalNixos pinnedContainer).systemd.services.example.serviceConfig.ExecStop}")
+
+    # --- two objects must not resolve to one unit -----------------------------------
+    (check "duplicate-service-name/fails-evaluation"
+      (buildFails serviceNameCollision)
+      "expected a container named \"backend-network\" alongside a network named \"backend\" (which takes that same service name) to fail evaluation, but it succeeded")
+
+    # --- on the NixOS plane the unit names this host's own docker, out of the store --
+    (check "nixos-plane/docker-path-is-a-store-path"
+      (lib.hasPrefix builtins.storeDir (evalNixos pinnedContainer).nixdocker.docker.path)
+      "nixdocker.docker.path: ${(evalNixos pinnedContainer).nixdocker.docker.path}")
   ];
 
   # ── Pure render-time checks: no nixosSystem at all -------------------------------
   baseContainerCfg = {
     image = { repository = "docker.io/library/nginx"; tag = "1.27"; inherit digest; };
-    rootless.uid = null;
-    command = null;
+    pull = "missing";
+    command = [ ];
     entrypoint = null;
     user = null;
-    pod = null;
-    network = null;
+    workdir = null;
+    hostname = null;
+    networks = [ ];
     environment = { };
+    environmentFiles = [ ];
     volumes = [ ];
     devices = [ ];
     ports = [ ];
-    oneshot = false;
-    waitForNetworkOnline = true;
+    labels = { };
+    capabilities = { add = [ ]; drop = [ ]; };
+    privileged = false;
+    logDriver = "journald";
+    autoRemove = true;
     health = { cmd = null; interval = "30s"; timeout = "5s"; retries = 3; startPeriod = "5s"; };
-    restart = { policy = "on-failure"; restartSec = 5; startLimitBurst = 3; startLimitIntervalSec = 600; };
-    extraUnitConfig = { };
-    extraContainerConfig = { };
-    extraServiceConfig = { };
+    extraArgs = [ ];
+  };
+
+  argvFor = overrides: render.mkRunArgv {
+    docker = "/usr/bin/docker";
+    name = "example";
+    cfg = baseContainerCfg // overrides;
+  };
+
+  baseNetworkCfg = {
+    driver = null;
+    subnet = null;
+    gateway = null;
+    internal = false;
+    ipv6 = false;
+    extraArgs = [ ];
   };
 
   renderResults = [
@@ -311,196 +425,123 @@ let
       (render.mkImageRef { repository = "example.org/app"; tag = null; inherit digest; } == "example.org/app@${digest}")
       "got: ${render.mkImageRef { repository = "example.org/app"; tag = null; inherit digest; }}")
 
-    (check "render/container-has-image-line"
-      (lib.hasInfix "Image=docker.io/library/nginx:1.27@${digest}" (render.renderContainer "example" baseContainerCfg))
-      "rendered: ${render.renderContainer "example" baseContainerCfg}")
+    (check "render/argv-starts-with-the-docker-binary-and-run"
+      (lib.take 2 (argvFor { }) == [ "/usr/bin/docker" "run" ])
+      "argv: ${builtins.toJSON (argvFor { })}")
 
-    (check "render/no-healthcheck-omits-all-health-keys"
-      (!(lib.hasInfix "Health" (render.renderContainer "example" baseContainerCfg)))
-      "rendered: ${render.renderContainer "example" baseContainerCfg}")
+    (check "render/argv-ends-with-the-image-when-no-command-is-given"
+      (lib.last (argvFor { }) == "docker.io/library/nginx:1.27@${digest}")
+      "argv: ${builtins.toJSON (argvFor { })}")
 
-    (check "render/healthcheck-set-renders-all-fields"
+    # THE ORDERING FACT THAT MATTERS: everything docker reads after the image name belongs to the
+    # container's process, so a flag landing behind it silently becomes an argument to the app.
+    (check "render/every-flag-comes-before-the-image-and-the-command-after-it"
       (
-        let text = render.renderContainer "example" (baseContainerCfg // { health = baseContainerCfg.health // { cmd = "curl -f http://localhost/health"; }; });
-        in lib.hasInfix "HealthCmd=curl -f http://localhost/health" text
-          && lib.hasInfix "HealthInterval=30s" text
-          && lib.hasInfix "HealthRetries=3" text
+        let
+          argv = argvFor { extraArgs = [ "--memory=4g" ]; command = [ "--config" "/etc/x.toml" ]; };
+          imageIndex = lib.lists.findFirstIndex (a: lib.hasInfix "@sha256:" a) null argv;
+          flagIndex = lib.lists.findFirstIndex (a: a == "--memory=4g") null argv;
+          cmdIndex = lib.lists.findFirstIndex (a: a == "--config") null argv;
+        in
+        flagIndex < imageIndex && cmdIndex > imageIndex
       )
-      "rendered: ${render.renderContainer "example" (baseContainerCfg // { health = baseContainerCfg.health // { cmd = "curl -f http://localhost/health"; }; })}")
+      "argv: ${builtins.toJSON (argvFor { extraArgs = [ "--memory=4g" ]; command = [ "--config" "/etc/x.toml" ]; })}")
 
-    (check "render/restart-policy-and-startlimit-rendered"
+    (check "render/no-healthcheck-omits-all-health-flags"
+      (!(lib.any (a: lib.hasPrefix "--health" a) (argvFor { })))
+      "argv: ${builtins.toJSON (argvFor { })}")
+
+    (check "render/healthcheck-set-renders-all-five-flags"
       (
-        let text = render.renderContainer "example" baseContainerCfg;
-        in lib.hasInfix "Restart=on-failure" text && lib.hasInfix "StartLimitBurst=3" text
+        let argv = argvFor { health = baseContainerCfg.health // { cmd = "curl -f http://localhost/health"; }; };
+        in lib.elem "--health-cmd=curl -f http://localhost/health" argv
+          && lib.elem "--health-interval=30s" argv
+          && lib.elem "--health-timeout=5s" argv
+          && lib.elem "--health-retries=3" argv
+          && lib.elem "--health-start-period=5s" argv
       )
-      "rendered: ${render.renderContainer "example" baseContainerCfg}")
+      "argv: ${builtins.toJSON (argvFor { health = baseContainerCfg.health // { cmd = "curl -f http://localhost/health"; }; })}")
 
-    (check "render/pod-reference-becomes-dot-pod-suffix"
-      (lib.hasInfix "Pod=myapp.pod" (render.renderContainer "example" (baseContainerCfg // { pod = "myapp"; })))
-      "rendered: ${render.renderContainer "example" (baseContainerCfg // { pod = "myapp"; })}")
-
-    (check "render/wait-for-network-online-false-adds-quadlet-section"
-      (lib.hasInfix "[Quadlet]" (render.renderContainer "example" (baseContainerCfg // { waitForNetworkOnline = false; }))
-        && lib.hasInfix "DefaultDependencies=false" (render.renderContainer "example" (baseContainerCfg // { waitForNetworkOnline = false; })))
-      "rendered: ${render.renderContainer "example" (baseContainerCfg // { waitForNetworkOnline = true; })}")
-
-    (check "render/wait-for-network-online-true-omits-quadlet-section"
-      (!(lib.hasInfix "[Quadlet]" (render.renderContainer "example" baseContainerCfg)))
-      "rendered: ${render.renderContainer "example" baseContainerCfg}")
-
-    (check "render/repeatable-keys-render-one-line-each"
+    (check "render/repeatable-flags-render-one-entry-each"
       (
-        let text = render.renderContainer "example" (baseContainerCfg // { volumes = [ "/a:/a" "/b:/b" ]; ports = [ "80:80" "443:443" ]; });
-        in lib.hasInfix "Volume=/a:/a" text && lib.hasInfix "Volume=/b:/b" text
-          && lib.hasInfix "PublishPort=80:80" text && lib.hasInfix "PublishPort=443:443" text
+        let argv = argvFor { volumes = [ "/a:/a" "/b:/b" ]; ports = [ "80:80" "443:443" ]; devices = [ "/dev/dri:/dev/dri" ]; };
+        in lib.elem "--volume=/a:/a" argv && lib.elem "--volume=/b:/b" argv
+          && lib.elem "--publish=80:80" argv && lib.elem "--publish=443:443" argv
+          && lib.elem "--device=/dev/dri:/dev/dri" argv
       )
-      "rendered: ${render.renderContainer "example" (baseContainerCfg // { volumes = [ "/a:/a" "/b:/b" ]; ports = [ "80:80" "443:443" ]; })}")
+      "argv: ${builtins.toJSON (argvFor { volumes = [ "/a:/a" "/b:/b" ]; ports = [ "80:80" "443:443" ]; devices = [ "/dev/dri:/dev/dri" ]; })}")
 
-    (check "render/devices-become-repeatable-adddevice-lines"
+    (check "render/journald-log-driver-is-stated-not-assumed"
+      (lib.elem "--log-driver=journald" (argvFor { }))
+      "argv: ${builtins.toJSON (argvFor { })}")
+
+    (check "render/log-driver-null-says-nothing"
+      (!(lib.any (a: lib.hasPrefix "--log-driver" a) (argvFor { logDriver = null; })))
+      "argv: ${builtins.toJSON (argvFor { logDriver = null; })}")
+
+    # systemd's ExecStart is not a shell: a value with a space must survive as ONE argument, and a
+    # `%` must not be read as a specifier.
+    (check "render/systemd-escaping-keeps-a-spaced-value-one-argument"
+      (render.escapeSystemdExecArgs [ "--health-cmd=curl -f http://x/y" ] == ''"--health-cmd=curl -f http://x/y"'')
+      "got: ${render.escapeSystemdExecArgs [ "--health-cmd=curl -f http://x/y" ]}")
+
+    (check "render/systemd-escaping-neutralises-specifiers-and-variables"
+      (render.escapeSystemdExecArgs [ "a%n" "b$HOME" ] == ''"a%%n" "b$$HOME"'')
+      "got: ${render.escapeSystemdExecArgs [ "a%n" "b$HOME" ]}")
+
+    (check "render/network-script-is-create-if-absent-and-says-so"
       (
-        let text = render.renderContainer "example" (baseContainerCfg // { devices = [ "/dev/sr0:/dev/sr0" "/dev/dri:/dev/dri" ]; });
-        in lib.hasInfix "AddDevice=/dev/sr0:/dev/sr0" text && lib.hasInfix "AddDevice=/dev/dri:/dev/dri" text
+        let text = render.mkNetworkScript { docker = "/usr/bin/docker"; name = "backend"; cfg = baseNetworkCfg // { subnet = "172.28.0.0/16"; }; };
+        in lib.hasInfix "network inspect" text
+          && lib.hasInfix "network create" text
+          && lib.hasInfix "--subnet=172.28.0.0/16" text
+          && lib.hasInfix "no reconcile verb" text
       )
-      "rendered: ${render.renderContainer "example" (baseContainerCfg // { devices = [ "/dev/sr0:/dev/sr0" "/dev/dri:/dev/dri" ]; })}")
-
-    (check "render/oneshot-false-leaves-quadlets-own-default-unmentioned"
-      (!(lib.hasInfix "Type=" (render.renderContainer "example" baseContainerCfg)))
-      "rendered: ${render.renderContainer "example" baseContainerCfg}")
-
-    (check "render/extra-container-config-escape-hatch"
-      (lib.hasInfix "AddCapability=CAP_NET_ADMIN" (render.renderContainer "example" (baseContainerCfg // { extraContainerConfig.AddCapability = "CAP_NET_ADMIN"; })))
-      "rendered: ${render.renderContainer "example" (baseContainerCfg // { extraContainerConfig.AddCapability = "CAP_NET_ADMIN"; })}")
+      "script: ${render.mkNetworkScript { docker = "/usr/bin/docker"; name = "backend"; cfg = baseNetworkCfg // { subnet = "172.28.0.0/16"; }; }}")
   ];
 
   allResults = results ++ renderResults;
   failed = builtins.filter (r: !r.ok) allResults;
   report = lib.concatMapStringsSep "\n" (r: "  - ${r.name}: ${r.detail}") failed;
 
-  # ── The one REAL build in this check suite -----------------------------------------------
-  # Runs the actual generator, on actual well-formed rendered text, through actual
-  # lib/build.nix -- then greps the OUTPUT unit for the exact strings that prove the mechanism,
-  # and runs `systemd-analyze verify` on it for real. If this derivation fails to build, `nix
-  # flake check` reports it directly; no eval-time indirection is involved.
-  wellFormedContainerText = render.renderContainer "web" {
-    image = { repository = "docker.io/library/nginx"; tag = "1.27"; inherit digest; };
-    rootless.uid = null;
-    command = null;
-    entrypoint = null;
-    user = "65534:65534";
-    pod = "webpod";
-    network = null;
-    environment = { EXAMPLE_VAR = "1"; };
-    volumes = [ "/srv/example/data:/data" ];
-    devices = [ ];
-    ports = [ ];
-    oneshot = false;
-    waitForNetworkOnline = true;
-    health = { cmd = "curl -f http://localhost/health"; interval = "30s"; timeout = "5s"; retries = 3; startPeriod = "5s"; };
-    restart = { policy = "on-failure"; restartSec = 5; startLimitBurst = 3; startLimitIntervalSec = 600; };
-    extraUnitConfig = { };
-    extraContainerConfig = { };
-    extraServiceConfig = { };
-  };
-
-  wellFormedPodText = render.renderPod "webpod" {
-    rootless.uid = null;
-    network = null;
-    ports = [ "8080:80" ];
-    restart = { policy = "on-failure"; restartSec = 5; startLimitBurst = 3; startLimitIntervalSec = 600; };
-    extraUnitConfig = { };
-    extraPodConfig = { };
-    extraServiceConfig = { };
-  };
-
-  # NOTE on `systemd-analyze verify`: the README and docs/gotchas.md both report that the
-  # generated units passed `systemd-analyze verify` clean -- checked directly, empirically,
-  # against this exact mechanism, before this repo's first commit (see docs/gotchas.md for the
-  # transcript). It is NOT re-run as part of THIS derivation: `systemd-analyze verify`
-  # unconditionally tries to create `/run/systemd/` for its own private sockets, and the Nix
-  # build sandbox provides no writable `/run` at all (confirmed directly: the identical command
-  # against the identical unit exits 0 outside the sandbox, where `/run/systemd` already exists
-  # on a live host, and fails with "mkdir: cannot create directory '/run': Permission denied"
-  # inside it -- neither `XDG_RUNTIME_DIR` nor `--root=` redirect that particular hardcoded path,
-  # also checked directly). Rather than reach for a `--user`/user-namespace workaround to fight
-  # the sandbox over one directory, this check asserts the same underlying facts a clean
-  # `systemd-analyze verify` would have confirmed -- real `ExecStart=`, `Type=notify`,
-  # `NotifyAccess=all`, the `Pod=` -> `BindsTo=` resolution, the healthcheck flag, the pod's
-  # reverse `Wants=` -- directly, by grep, against the real generator's real output.
-  realBuildCheck = pkgs.runCommand "nixdocker-quadlet-generates-real-units"
+  # ── The one REAL build in this check suite ------------------------------------------------
+  # `systemd.units.<name>.unit` is the derivation NixOS's own unit writer produced from the
+  # definitions this repo composed. Building it and grepping the file is the end of the round trip:
+  # it proves the escaped ExecStart, the daemon ordering and the sweeps are really in the unit that
+  # would land on a host, not merely in an attrset that looked right at eval time.
+  realUnitCheck = pkgs.runCommand "nixdocker-renders-a-real-unit-file"
     {
-      units = build.mkQuadletUnitPackage {
-        inherit pkgs podman;
-        type = "system";
-        objects = [
-          { ref = "web.container"; serviceName = "web"; text = wellFormedContainerText; }
-          { ref = "webpod.pod"; serviceName = "webpod-pod"; text = wellFormedPodText; }
-        ];
-      };
+      unit = (evalNixos containerWithRealNetwork).systemd.units."example.service".unit;
+      networkUnit = (evalNixos containerWithRealNetwork).systemd.units."backend-network.service".unit;
     }
     ''
       set -eu
-      SVC="$units/lib/systemd/system/web.service"
-      POD="$units/lib/systemd/system/webpod-pod.service"
+      SVC="$unit/example.service"
+      NET="$networkUnit/backend-network.service"
 
-      test -e "$SVC" || { echo "expected web.service to exist, it does not" >&2; exit 1; }
-      test -e "$POD" || { echo "expected webpod-pod.service to exist, it does not" >&2; exit 1; }
+      test -e "$SVC" || { echo "expected example.service to exist, it does not" >&2; ls -R "$unit" >&2; exit 1; }
+      test -e "$NET" || { echo "expected backend-network.service to exist, it does not" >&2; ls -R "$networkUnit" >&2; exit 1; }
 
-      grep -q '^ExecStart=.*bin/podman run' "$SVC" || { echo "web.service has no real podman ExecStart=" >&2; cat "$SVC" >&2; exit 1; }
-      grep -q '^Type=notify$' "$SVC" || { echo "web.service is not Type=notify" >&2; cat "$SVC" >&2; exit 1; }
-      grep -q '^NotifyAccess=all$' "$SVC" || { echo "web.service has no NotifyAccess=all" >&2; cat "$SVC" >&2; exit 1; }
-      grep -q '^BindsTo=webpod-pod.service$' "$SVC" || { echo "web.service's Pod= did not resolve to a literal BindsTo=" >&2; cat "$SVC" >&2; exit 1; }
-      grep -q -- '--health-cmd' "$SVC" || { echo "web.service lost the HealthCmd=" >&2; cat "$SVC" >&2; exit 1; }
-      grep -q '^Wants=web.service$' "$POD" || { echo "webpod-pod.service did not gain the reverse Wants=web.service" >&2; cat "$POD" >&2; exit 1; }
+      grep -q '^ExecStart=.*/bin/docker" "run"' "$SVC" || { echo "example.service has no real docker run ExecStart=" >&2; cat "$SVC" >&2; exit 1; }
+      grep -q -- '"--rm"' "$SVC" || { echo "example.service lost --rm" >&2; cat "$SVC" >&2; exit 1; }
+      grep -q -- '"--network=backend"' "$SVC" || { echo "example.service lost its --network" >&2; cat "$SVC" >&2; exit 1; }
+      grep -q '@sha256:' "$SVC" || { echo "example.service does not name a digest-pinned image" >&2; cat "$SVC" >&2; exit 1; }
+      grep -q '^Requires=.*docker.socket' "$SVC" || { echo "example.service does not require docker.socket" >&2; cat "$SVC" >&2; exit 1; }
+      grep -q '^Requires=.*backend-network.service' "$SVC" || { echo "example.service does not require its network's unit" >&2; cat "$SVC" >&2; exit 1; }
+      grep -q '^ExecStartPre=-' "$SVC" || { echo "example.service has no failure-tolerated ExecStartPre sweep" >&2; cat "$SVC" >&2; exit 1; }
 
-      echo "quadlet generated real units for both web.service and webpod-pod.service, with the Pod=/health/notify facts confirmed by grep against the generator's real output" > $out
-    '';
-
-  # ── The second REAL build: the two facts that make the foreign-distro plane possible -------
-  # Both are properties of the generator itself, not of any Nix code in this repo, so neither can
-  # be asserted at eval time -- they only exist once the real binary has run:
-  #
-  #   1. `PODMAN=<path>` redirects the generated Exec* lines away from the store path of the
-  #      podman that did the generating. That is what lets a system-manager host point its units
-  #      at the distro's own podman instead of carrying a second copy of the CLI.
-  #   2. `Type=oneshot` is not a relabelling: the generator DROPS `-d` and `--sdnotify=conmon`
-  #      from the ExecStart it writes, which is the whole difference between a detached service
-  #      and a job whose completion `systemctl start` actually waits for.
-  foreignPodmanCheck = pkgs.runCommand "nixdocker-quadlet-honours-foreign-podman-path"
-    {
-      units = build.mkQuadletUnitPackage {
-        inherit pkgs podman;
-        type = "system";
-        podmanPath = "/usr/bin/podman";
-        objects = [{
-          ref = "ripper.container";
-          serviceName = "ripper";
-          text = render.renderContainer "ripper" (baseContainerCfg // {
-            oneshot = true;
-            devices = [ "/dev/sr0:/dev/sr0" ];
-            restart = baseContainerCfg.restart // { policy = "no"; };
-          });
-        }];
-      };
-    }
-    ''
-      set -eu
-      SVC="$units/lib/systemd/system/ripper.service"
-      test -e "$SVC" || { echo "expected ripper.service to exist, it does not" >&2; exit 1; }
-
-      grep -q '^ExecStart=/usr/bin/podman run' "$SVC" || { echo "the generated ExecStart= did not honour PODMAN=/usr/bin/podman" >&2; cat "$SVC" >&2; exit 1; }
-      grep -q '^ExecStop=/usr/bin/podman' "$SVC" || { echo "the generated ExecStop= did not honour PODMAN=/usr/bin/podman" >&2; cat "$SVC" >&2; exit 1; }
-      grep -qv '/nix/store/.*/bin/podman' "$SVC" || { echo "a store podman path survived into the unit" >&2; cat "$SVC" >&2; exit 1; }
-
-      grep -q '^Type=oneshot$' "$SVC" || { echo "Type=oneshot did not reach the generated unit" >&2; cat "$SVC" >&2; exit 1; }
-      grep -q -- '--device /dev/sr0:/dev/sr0' "$SVC" || { echo "AddDevice= did not become --device" >&2; cat "$SVC" >&2; exit 1; }
-
-      if grep -qE -- '(--sdnotify=conmon| -d )' "$SVC"; then
-        echo "a oneshot unit kept the detached/notify flags -- systemctl start would no longer wait for the job" >&2
+      # The daemon's own restart policy must not be anywhere near this unit -- systemd's Restart= is
+      # the only supervision this repo installs.
+      if grep -q -- '"--restart' "$SVC"; then
+        echo "a docker --restart flag reached the generated unit -- that is a second supervisor" >&2
         cat "$SVC" >&2
         exit 1
       fi
 
-      echo "the generator honoured PODMAN=/usr/bin/podman and rendered a foreground oneshot ExecStart with the device passed through" > $out
+      grep -q '^Type=oneshot$' "$NET" || { echo "the network unit is not a oneshot" >&2; cat "$NET" >&2; exit 1; }
+      grep -q '^RemainAfterExit=true$' "$NET" || { echo "the network unit does not remain after exit, so a container's Requires= on it would not stay satisfied" >&2; cat "$NET" >&2; exit 1; }
+
+      echo "the composed definitions round-tripped through systemd's own unit writer with the docker argv, the daemon ordering, the network dependency and the sweeps intact" > $out
     '';
 in
 if failed != [ ]
@@ -517,7 +558,5 @@ else {
       touch $out
     '';
 
-  quadlet-generates-real-units = realBuildCheck;
-
-  quadlet-honours-foreign-podman-path = foreignPodmanCheck;
+  renders-a-real-unit-file = realUnitCheck;
 }
