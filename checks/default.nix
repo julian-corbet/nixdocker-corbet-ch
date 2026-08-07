@@ -407,7 +407,7 @@ let
       "nixdocker packages baseline must resolve on NixOS without failing the build")
 
     (check "packages/baseline-names-compose-and-buildx"
-      ((evalNixosPackages { }).nixdocker.packages.baseline == [ "docker-compose" "docker-buildx" ])
+      ((evalNixosPackages { }).nixdocker.packages.baseline == [ "docker" "docker-compose" "docker-buildx" ])
       "nixdocker.packages.baseline: ${builtins.toJSON (evalNixosPackages { }).nixdocker.packages.baseline}")
 
     (check "packages/compose-and-buildx-reach-environment-systemPackages"

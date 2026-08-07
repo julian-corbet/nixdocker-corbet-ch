@@ -22,8 +22,8 @@ in
     # Baseline package names before backend mapping.
     baseline = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [ "docker-compose" "docker-buildx" ];
-      defaultText = lib.literalExpression ''[ "docker-compose" "docker-buildx" ]'';
+      default = [ "docker" "docker-compose" "docker-buildx" ];
+      defaultText = lib.literalExpression ''[ "docker" "docker-compose" "docker-buildx" ]'';
       description = ''
         Baseline packages this module declares for all nixdocker consumers, before a backend maps
         them to its concrete package source format.
