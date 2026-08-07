@@ -225,8 +225,10 @@ a second supervisor.
 
 **vs. Compose** -- not modelled, and not planned. A `docker-compose.yml` is its own declarative
 format with its own lifecycle; wrapping it in Nix options would produce a second, worse dialect of
-it. The compose CLI is a development tool the distro installs, and this repo has no opinion about
-it.
+it. The CLIs themselves are a different matter: `nixdocker.packages` declares `docker-compose` and
+`docker-buildx` as host tooling that belongs with the plane that uses them (see
+[`modules/packages.nix`](modules/packages.nix)) -- but that is a package-presence policy, not a
+model of Compose's file format or lifecycle.
 
 ## Usage
 
@@ -284,6 +286,7 @@ nixdocker.daemon.firewallBackend = "nftables";   # daemon.json in place, nothing
 | `modules/daemon.nix` | `nixdocker.daemon` -- the daemon lifecycle and `daemon.json`. No counterpart in the podman sibling. |
 | `modules/nixdocker.nix` | The wiring that is true on every plane: renders each argv, composes the units, orders them against the daemon and the networks. |
 | `modules/nixos.nix` / `modules/system-manager.nix` | The two thin per-plane backends; each header says exactly what it adds and why that part could not be shared. |
+| `modules/packages.nix` / `packages.arch.nix` / `packages.nixos.nix` | `nixdocker.packages` -- the one declared-tooling exception (`docker-compose`, `docker-buildx`), opt-in and separate from the plane-neutral wiring above. |
 | `lib/render.nix` | The pure typed-option -> `docker run` argv translation, plus the vendored systemd exec escaping. |
 | `lib/options.nix` | Option fragments shared by both kinds, and the header explaining the deliberate parallel with nixpods. |
 | `docs/gotchas.md` | The empirical findings this design is built on -- transcripts, not assertions, and explicit about which came from running something and which from reading a binary. |

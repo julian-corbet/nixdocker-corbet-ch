@@ -29,6 +29,14 @@
       systemManagerModules.nixdocker = ./modules/system-manager.nix;
       systemManagerModules.default = self.systemManagerModules.nixdocker;
 
+      # nixdocker.packages -- declared host tooling (docker-compose, docker-buildx), NOT part of
+      # the plane-neutral wiring above and not pulled in by
+      # nixosModules.nixdocker/systemManagerModules.nixdocker on its own. A separate opt-in
+      # module, same shape as nixiam's own packages.nix/.arch.nix/.nixos.nix trio -- see
+      # modules/packages.nix's header for why this repo declares packages at all.
+      systemManagerModules.packages = ./modules/packages.arch.nix;
+      nixosModules.packages = ./modules/packages.nixos.nix;
+
       # The pure pieces, exposed for inspection or reuse without a module-system evaluation. There
       # is deliberately no `lib.build` here, unlike in this repo's podman sibling: podman ships a
       # real systemd generator that nixpods runs at build time, and docker ships nothing of the
@@ -44,6 +52,7 @@
             pkgs = nixpkgs.legacyPackages.${system};
             inherit lib system;
             nixdockerModule = self.nixosModules.nixdocker;
+            packagesModule = self.nixosModules.packages;
           }
         // {
           system-manager-eval-tests = import ./checks/system-manager-eval-tests.nix {

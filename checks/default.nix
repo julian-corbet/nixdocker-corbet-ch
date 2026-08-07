@@ -25,7 +25,7 @@
 # What CANNOT be checked anywhere in this file is whether the rendered `docker run` argv is one the
 # docker CLI accepts: that needs a daemon, which needs root and a running host, which is exactly
 # what a check may not have. See the README's "What this repo cannot promise".
-{ pkgs, lib, system, nixdockerModule }:
+{ pkgs, lib, system, nixdockerModule, packagesModule }:
 
 let
   render = import ../lib/render.nix { inherit lib; };
@@ -59,6 +59,24 @@ let
 
   evalOk = extraConfig: (evalToplevel extraConfig).success;
   buildFails = extraConfig: !(evalToplevel extraConfig).success;
+
+  # ── nixdocker.packages -- a SEPARATE opt-in module (modules/packages.nixos.nix), not pulled in
+  # by nixdockerModule, so it needs its own composition rather than reusing evalNixos/evalToplevel
+  # above. Same proof nixiam's own checks/default.nix runs for its packages module: the baseline
+  # resolves on NixOS, and an unresolvable override fails the build by name.
+  evalNixosPackages = extraConfig:
+    (lib.nixosSystem {
+      inherit system;
+      modules = [ packagesModule extraConfig bootStub ];
+    }).config;
+
+  packagesEvalToplevel = extraConfig:
+    builtins.tryEval (builtins.seq
+      (builtins.unsafeDiscardStringContext (evalNixosPackages extraConfig).system.build.toplevel.drvPath)
+      true);
+
+  packagesEvalOk = extraConfig: (packagesEvalToplevel extraConfig).success;
+  packagesBuildFails = extraConfig: !(packagesEvalToplevel extraConfig).success;
 
   # ── Fixtures ─────────────────────────────────────────────────────────────────────
   daemonOn = { nixdocker.daemon.enable = true; };
@@ -227,6 +245,10 @@ let
     ];
   };
 
+  packagesBaselineMissing = {
+    nixdocker.packages.baseline = [ "docker-compose" "docker-buildx" "definitely-does-not-exist-in-nixpkgs" ];
+  };
+
   results = [
     # --- a fully-pinned container composes -------------------------------------------
     (check "pinned-container/toplevel-evaluates"
@@ -377,6 +399,29 @@ let
       "nixdocker.docker.path: ${(evalNixos pinnedContainer).nixdocker.docker.path}")
   ];
 
+  # ── nixdocker.packages -- the declared host tooling exception, proven the same way nixiam
+  # proves its own baseline: resolves cleanly by default, fails by name when it cannot ─────────
+  packageResults = [
+    (check "packages/default-baseline-builds-on-nixos"
+      (packagesEvalOk { })
+      "nixdocker packages baseline must resolve on NixOS without failing the build")
+
+    (check "packages/baseline-names-compose-and-buildx"
+      ((evalNixosPackages { }).nixdocker.packages.baseline == [ "docker-compose" "docker-buildx" ])
+      "nixdocker.packages.baseline: ${builtins.toJSON (evalNixosPackages { }).nixdocker.packages.baseline}")
+
+    (check "packages/compose-and-buildx-reach-environment-systemPackages"
+      (
+        let names = map (p: p.pname or p.name) (evalNixosPackages { }).environment.systemPackages;
+        in lib.elem "docker-compose" names && lib.elem "docker-buildx" names
+      )
+      "environment.systemPackages: ${builtins.toJSON (map (p: p.pname or p.name) (evalNixosPackages { }).environment.systemPackages)}")
+
+    (check "packages/unresolvable-entry-fails-on-nixos"
+      (packagesBuildFails packagesBaselineMissing)
+      "a baseline override that names a non-existent nixpkgs package must fail on NixOS")
+  ];
+
   # ── Pure render-time checks: no nixosSystem at all -------------------------------
   baseContainerCfg = {
     image = { repository = "docker.io/library/nginx"; tag = "1.27"; inherit digest; };
@@ -500,7 +545,7 @@ let
       "script: ${render.mkNetworkScript { docker = "/usr/bin/docker"; name = "backend"; cfg = baseNetworkCfg // { subnet = "172.28.0.0/16"; }; }}")
   ];
 
-  allResults = results ++ renderResults;
+  allResults = results ++ renderResults ++ packageResults;
   failed = builtins.filter (r: !r.ok) allResults;
   report = lib.concatMapStringsSep "\n" (r: "  - ${r.name}: ${r.detail}") failed;
 
