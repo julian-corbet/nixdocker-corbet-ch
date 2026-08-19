@@ -43,6 +43,22 @@
 
 let
   cfg = config.nixdocker;
+
+  # WHICH DISTRO UNIT `daemon.onBoot` RESOLVES TO ON THIS PLANE.
+  #
+  # There is no `virtualisation.docker.enableOnBoot` to set here -- that option is NixOS's, and
+  # modules/nixos.nix is the only place it gets driven. On a foreign distro the same distinction is
+  # expressible only as a choice of WHICH of the distro's own two units this config depends on:
+  # `docker.service` is the resident daemon, `docker.socket` is the identical daemon started by
+  # systemd on the first client connect. Both units are the distro's; this config writes neither,
+  # and the only thing `onBoot` changes here is the name inside `Requires=`/`After=`.
+  #
+  # Until this existed, `onBoot` was declared for both planes in modules/daemon.nix, consumed only
+  # by modules/nixos.nix, and read by nothing here -- so on the plane this repo's own README calls
+  # the PRIMARY one, `onBoot = false` was accepted and silently ignored while the target pulled
+  # `docker.service` up resident anyway. An option that is accepted and does nothing is worse than
+  # one that does not exist, because the config reads as though the host asked and got it.
+  daemonUnit = if cfg.daemon.onBoot then "docker.service" else "docker.socket";
 in
 {
   imports = [ ./nixdocker.nix ];
@@ -91,19 +107,21 @@ in
       # name. See docs/gotchas.md.
       systemd.targets.nixdocker-daemon = {
         description = "nixdocker: this host wants the docker daemon";
-        requires = [ "docker.service" ];
-        after = [ "docker.service" ];
+        requires = [ daemonUnit ];
+        after = [ daemonUnit ];
         wantedBy = [ "multi-user.target" ];
       };
 
       system-manager.preActivationAssertions.nixdocker-dockerd = {
         enable = true;
         script = ''
-          if ! systemctl cat docker.service >/dev/null 2>&1; then
-            echo "nixdocker: nixdocker.daemon.enable is true, but this host has no docker.service."
+          if ! systemctl cat ${daemonUnit} >/dev/null 2>&1; then
+            echo "nixdocker: nixdocker.daemon.enable is true, but this host has no ${daemonUnit}."
             echo "This plane does not install docker -- the distro's own package owns dockerd and its"
             echo "units, and nixdocker only declares a target that Requires= it. Install the distro's"
             echo "docker package first, or set nixdocker.daemon.enable = false."
+            echo "(nixdocker.daemon.onBoot = ${lib.boolToString cfg.daemon.onBoot} selects this unit;"
+            echo "the other one is ${if cfg.daemon.onBoot then "docker.socket" else "docker.service"}.)"
             exit 1
           fi
         '';

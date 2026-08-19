@@ -70,6 +70,16 @@ let
   live = evalFor workstation;
   idle = evalFor declaredOnly;
 
+  # The same host, asking for the daemon on demand instead of resident. `onBoot` is the one daemon
+  # option this plane expresses by choosing WHICH distro unit to depend on rather than by setting
+  # anything, so it needs its own fixture to be provable in both directions -- see below.
+  onDemand = evalFor {
+    nixdocker.daemon = {
+      enable = true;
+      onBoot = false;
+    };
+  };
+
   results = [
     (check "system-manager/plain-container-becomes-a-real-service"
       (live.systemd.services ? web)
@@ -112,6 +122,24 @@ let
         in t.requires == [ "docker.service" ] && t.wantedBy == [ "multi-user.target" ]
       )
       "systemd.targets.nixdocker-daemon: ${builtins.toJSON live.systemd.targets.nixdocker-daemon}")
+
+    # ── onBoot, BOTH DIRECTIONS ────────────────────────────────────────────────────────────
+    # This option was declared for both planes in modules/daemon.nix, consumed only by
+    # modules/nixos.nix (`enableOnBoot`), and read by nothing on this plane -- so `onBoot = false`
+    # was accepted and silently ignored here while the target pulled docker.service up resident
+    # anyway, on the plane this repo's own README calls the PRIMARY one. The check above proves the
+    # `true` direction; without this one the `false` direction can regress back to a no-op without
+    # anything failing, which is exactly how it went unnoticed the first time.
+    (check "system-manager/onBoot-false-requires-the-socket-not-the-service"
+      (
+        let t = onDemand.systemd.targets.nixdocker-daemon;
+        in t.requires == [ "docker.socket" ] && t.after == [ "docker.socket" ]
+      )
+      "onBoot=false target: ${builtins.toJSON onDemand.systemd.targets.nixdocker-daemon}")
+
+    (check "system-manager/onBoot-false-asserts-against-the-socket-it-actually-depends-on"
+      (lib.hasInfix "docker.socket" onDemand.system-manager.preActivationAssertions.nixdocker-dockerd.script)
+      "onBoot=false pre-activation assertion did not name docker.socket: ${onDemand.system-manager.preActivationAssertions.nixdocker-dockerd.script}")
 
     (check "system-manager/this-config-never-defines-docker.service-itself"
       (!(live.systemd.services ? docker))
